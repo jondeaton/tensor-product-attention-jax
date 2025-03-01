@@ -10,57 +10,34 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from jaxtyping import Int, Bool, Float, Array
-
-
-def reference(
-    aq: Float[Array, "b lq rq h"],
-    bq: Float[Array, "b lq rq dh"],
-    ak: Float[Array, "b lk rk h"],
-    bk: Float[Array, "b lk rk dh"],
-    av: Float[Array, "b lk rv h"],
-    bv: Float[Array, "b lk rv dv"],
-    sm_scale: Float,
-) -> Float[Array, "b lq h dv"]:
-    """Tensor product attention without materializing Q, K, V.
-
-    TODO: make a pallas kernel for it.
-
-    """
-    b, lq, rq, h = aq.shape
-    _, lk, rk, dh = bv.shape
-
-    # lol
-    bb = einops.einsum(bq, bk, " b lq rq d, b lk rk d -> b lq lk rq rk")
-
-    qk = einops.einsum(
-        aq, ak, bb, "b lq rq h, b lk rk h, b lq lk rq rk -> b h lq lk"
-    ) / (rq * rk)
-
-    qk *= sm_scale
-    p = jax.nn.softmax(qk, axis=-1)
-    return einops.einsum(p, av, bv, "b h lq lk, b lk rv h, b lk rv dv -> b h lq rv")
+from jaxtyping import Int, Float, Array
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
 def tpa(
-    q: Float[Array, "b lq rq h (1 + dh)"],
-    k: Float[Array, "b lk rk h (1 + dh)"],
-    v: Float[Array, "b lk rk h (1 + dv)"],
+    q: Float[Array, "b lq rq (h + dh)"],
+    k: Float[Array, "b lk rk (h + dh)"],
+    v: Float[Array, "b lk rk (h + dv)"],
     q_segment_ids: Int[Array, "b lq"],
     kv_segment_ids: Int[Array, "b lk"],
-    sm_scale: Float,
+    num_heads: int,
+    sm_scale: float = 1.0,
     causal: bool = False,
+    debug: bool = False,
+    interpret: bool = False,
 ) -> Float[Array, "b lq h dv"]:
     """Tensor Product Attention kernel."""
     batch_size, q_len, rank_q, dim_k = q.shape
     _, k_len, rank_k, dim_v = v.shape
 
     o, _ = jax.vmap(  # over batch
-        jax.vmap(
-            functools.partial(_fwd_kernel, causal=causal, sm_scale=sm_scale),
-            in_axes=[2, 2, 2, None, None],
-            out_axes=1,
+        functools.partial(
+            _fwd,
+            num_heads=num_heads,
+            causal=causal,
+            sm_scale=sm_scale,
+            debug=debug,
+            interpret=interpret,
         ),
         in_axes=[0, 0, 0, 0, 0],
         out_axes=0,
@@ -82,6 +59,7 @@ def lse_combine(a: jax.Array, b: jax.Array) -> jax.Array:
     = a + log(1 + exp(b - a))
     = a + softplus(b - a)
     """
+    assert a.shape == b.shape, f"mismatching shapes: {a.shape}, {b.shape}"
     max = jnp.maximum(a, b)
     min = jnp.minimum(a, b)
     return max + jnp.log(1 + jnp.exp(min - max))
@@ -97,13 +75,11 @@ def _fwd_kernel(
     q_segment_ids_ref: Int[Array, " lq"],
     kv_segment_ids_ref: Int[Array, " lk"],
     o_ref: Float[Array, "lq h dv"],
+    l_ref: Float[Array, "lq h"],
     sm_scale: float,
     causal: bool,
-    block_k: int = 128,
-) -> tuple[
-    Float[Array, "lq h dv"],  # out
-    Float[Array, "lq h"],  # lse
-]:
+    block_kv: int,
+):
     """TPA forward pallas kernel.
 
     the main question here is should we parallelize across query heads or ranks?
@@ -117,15 +93,22 @@ def _fwd_kernel(
         - atomic add wouldn't be necessary on TPU
 
     Args:
-        q_ref: factorized queries (block)
-        k_ref: factorized keys
-        v_ref: factorized values
+        q(a|b)_ref: factorized queries (block)
+        k(a|b)_ref: factorized keys
+        v(a|b)_ref: factorized values
         q_segment_ids_ref: segment ids for queries (block)
         kv_segment_ids_ref: segment ids for keys and values.
+        o_ref: output array reference
+        l_ref: log-sum-exp array reference to write normalization factors.
+        sm_scale: softmax scale
+        causal: whether to apply a causal kernel.
+        block_kv: block size to split key/value arrays
 
     Returns:
-
+        nothing its a kernel.
     """
+    rank_q = qa_ref.shape[1]
+    rank_k = ka_ref.shape[1]
     block_q, block_h, dv = o_ref.shape
 
     start_q = pl.program_id(1)
@@ -135,29 +118,33 @@ def _fwd_kernel(
 
     def _scan_fn(start_k: int, carry):
         o, l_prev = carry
+        assert o.shape == (block_h, block_q, dv), o.shape
+        assert l_prev.shape == (block_h, block_q), l_prev.shape
 
-        kv_slice = pl.dslice(start_k * block_k, block_k)
+        kv_slice = pl.dslice(start_k * block_kv, block_kv)
 
         ka = ka_ref[kv_slice, slice(None), slice(None)]
         kb = kb_ref[kv_slice, slice(None), slice(None)]
 
         bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-        x = einops.einsum(qa, ka, bb, "lq rq h, lk rk h, lq lk rk -> h lq lk")
+
+        x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
+        x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+        # x = einops.einsum(qa, ka, bb, "lq rq h, lk rk h, lq lk rk -> h lq lk")
+        x *= sm_scale
 
         kv_segment_ids = kv_segment_ids_ref[kv_slice]
         mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
         if causal:
             span_q = start_q * block_q + jnp.arange(block_q)
-            span_k = start_k * block_k + jnp.arange(block_k)
+            span_k = start_k * block_kv + jnp.arange(block_kv)
             causal_mask = span_q[:, None] >= span_k[None, :]
             mask &= causal_mask
-        x = jnp.where(mask[..., None], x, -jnp.inf)
-
-        if sm_scale != 1.0:
-            x *= sm_scale  # [block_q, block_k]
+        x = jnp.where(mask[None, ...], x, -jnp.inf)
 
         m = jnp.max(x, axis=-1)
-        l_ = m + jnp.log(jnp.sum(jnp.exp(x - m), axis=-1))
+        l_ = m + jnp.log(jnp.sum(jnp.exp(x - m[..., None]), axis=-1))
+        assert l_.shape == (block_h, block_q), l_.shape
 
         l = lse_combine(l_prev, l_)
 
@@ -167,25 +154,31 @@ def _fwd_kernel(
         va = va_ref[kv_slice, slice(None), slice(None)]
         vb = vb_ref[kv_slice, slice(None), slice(None)]
 
-        pva = einops.einsum(p, va, "h lq lk, lk rk h -> lq h rk")
-        o_ = einops.einsum(vb, pva, "lq rk dv, lq h rk -> lq h dv")
+        v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
+        o_ = einops.einsum(p, v, "h lq lk, lk h dv -> h lq dv")
+        assert o_.shape == (block_h, block_q, dv), o_.shape
+
+        # honestly idk if this can fit into smem
+        # pva = einops.einsum(p, va, "h lq lk, lk rk h -> h lq lk rk")
+        # o_ = einops.einsum(pva, vb, "h lq lk rk, lk rk dv -> h lq dv")
+
         o = jnp.exp(l_prev - l)[..., None] * o + o_
 
         return o, l
 
     if causal:
-        num_kv_blocks = jax.lax.div(block_q * (start_q + 1) + block_k - 1, block_k)
+        num_kv_blocks = jax.lax.div(block_q * (start_q + 1) + block_kv - 1, block_kv)
     else:
         kv_len = ka_ref.shape[0]
-        num_kv_blocks = pl.cdiv(kv_len, block_k)
+        num_kv_blocks = pl.cdiv(kv_len, block_kv)
 
-    o = jnp.zeros(shape=(block_q, block_h, dv), dtype=jnp.float32)
-    l = jnp.zeros(shape=(block_q, block_h), dtype=jnp.float32) - jnp.inf
+    o = jnp.zeros(shape=(block_h, block_q, dv), dtype=jnp.float32)
+    l = jnp.zeros(shape=(block_h, block_q), dtype=jnp.float32) - jnp.inf
     o, l = jax.lax.fori_loop(0, num_kv_blocks, _scan_fn, (o, l))
 
     # store final output
-    o_ref[...] = o
-    l_ref[...] = l
+    o_ref[...] = einops.rearrange(o, "h l d -> l h d")
+    l_ref[...] = einops.rearrange(l, "h l -> l h")
 
 
 def _fwd(
@@ -198,10 +191,10 @@ def _fwd(
     sm_scale: Float,
     causal: bool = False,
     block_q: int = 128,
-    block_k: int = 128,
+    block_kv: int = 128,
     block_h: int = 4,
     debug: bool = False,
-    interpret: bool = True,
+    interpret: bool = False,
 ) -> tuple[
     Float[Array, "lq h dv"],
     Float[Array, "lq h"],
@@ -211,7 +204,7 @@ def _fwd(
     Args:
         ...
         block_q: size of query blocks
-        block_k: size of key/value blocks
+        block_kv: size of key/value blocks
         block_h: number of heads to compute in parallel within each thread. Note that
            this number defines the number of heads which share the same computation of
            query/key inner products across ranks.
@@ -219,19 +212,23 @@ def _fwd(
     q_len, rank_q, dim_k = q.shape
     k_len, rank_k, dim_v = v.shape
 
-    assert q_len % block_q == 0, (q_len, block_q)
-    assert k_len % block_k == 0, (k_len, block_k)
+    # assert q_len % block_q == 0, (q_len, block_q)
+    # assert k_len % block_kv == 0, (k_len, block_kv)
 
-    qa, qb = q[:, :, :num_heads], q[:, :, num_heads + 1 :]
-    ka, kb = k[:, :, :num_heads], q[:, :, num_heads + 1 :]
-    va, vb = v[:, :, :num_heads], q[:, :, num_heads + 1 :]
+    qa, qb = q[:, :, :num_heads], q[:, :, num_heads:]
+    ka, kb = k[:, :, :num_heads], q[:, :, num_heads:]
+    va, vb = v[:, :, :num_heads], q[:, :, num_heads:]
+
+    block_q = min(block_q, q_len)
+    block_kv = min(block_kv, k_len)
+    block_h = min(block_h, num_heads)
 
     return pl.pallas_call(
         functools.partial(
             _fwd_kernel,
             sm_scale=sm_scale,
             causal=causal,
-            block_k=block_k,
+            block_kv=block_kv,
         ),
         grid=(
             pl.cdiv(num_heads, block_h),
@@ -239,13 +236,13 @@ def _fwd(
         ),
         in_specs=[
             pl.BlockSpec((block_q, rank_q, block_h), lambda h, lq: (lq, 0, h)),  # qa
-            pl.BlockSpec((block_q, rank_q, dim_k), lambda h, lq: (lq, 0, 0)),  # qb
-            pl.BlockSpec((k_len, rank_k, block_h), lambda h, lq: (0, 0, h)),  # ka
-            pl.BlockSpec((k_len, rank_k, dim_k), lambda h, lq: (0, 0, 0)),  # kb
-            pl.BlockSpec((k_len, rank_k, block_h), lambda h, lq: (0, 0, h)),  # va
-            pl.BlockSpec((k_len, rank_k, dim_k), lambda h, lq: (0, 0, 0)),  # vb
-            pl.BlockSpec((block_q,), lambda h, lq: (lq,)),  # q_segment_ids
-            pl.BlockSpec((k_len,), lambda h, lq: (0,)),  # kv_segment_ids
+            pl.BlockSpec((block_q, rank_q, dim_k), lambda _, lq: (lq, 0, 0)),  # qb
+            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # ka
+            pl.BlockSpec((k_len, rank_k, dim_k), lambda *_: (0, 0, 0)),  # kb
+            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # va
+            pl.BlockSpec((k_len, rank_k, dim_v), lambda *_: (0, 0, 0)),  # vb
+            pl.BlockSpec((block_q,), lambda _, lq: (lq,)),  # q_segment_ids
+            pl.BlockSpec((k_len,), lambda *_: (0,)),  # kv_segment_ids
         ],
         out_specs=[
             pl.BlockSpec((block_q, block_h, dim_v), lambda h, lq: (lq, h, 0)),  # out
@@ -264,13 +261,11 @@ def _fwd(
         debug=debug,
         interpret=interpret,
         name="tpa_fwd",
-    )(
-        qa=qa,
-        qb=qb,
-        ka=ka,
-        kb=kb,
-        va=va,
-        vb=vb,
-        q_segment_ids=q_segment_ids,
-        kv_segment_ids=kv_segment_ids,
-    )
+    )(qa, qb, ka, kb, va, vb, q_segment_ids, kv_segment_ids)
+
+
+def _bwd(*args, **kwargs):
+    raise NotImplementedError("Backward pass not implemented.")
+
+
+tpa.defvjp(_fwd, _bwd)
