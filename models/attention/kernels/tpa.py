@@ -126,6 +126,8 @@ def _fwd_kernel(
         ka = ka_ref[kv_slice, slice(None), slice(None)]
         kb = kb_ref[kv_slice, slice(None), slice(None)]
 
+        # jax.debug.print("{x}", x=kb)
+
         bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
 
         x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
@@ -209,19 +211,24 @@ def _fwd(
            this number defines the number of heads which share the same computation of
            query/key inner products across ranks.
     """
-    q_len, rank_q, dim_k = q.shape
-    k_len, rank_k, dim_v = v.shape
-
-    # assert q_len % block_q == 0, (q_len, block_q)
-    # assert k_len % block_kv == 0, (k_len, block_kv)
+    q_len, rank_q, h_dk = q.shape
+    k_len, rank_k, h_dv = v.shape
+    assert k.shape == (k_len, rank_k, h_dk), k.shape
 
     qa, qb = q[:, :, :num_heads], q[:, :, num_heads:]
-    ka, kb = k[:, :, :num_heads], q[:, :, num_heads:]
-    va, vb = v[:, :, :num_heads], q[:, :, num_heads:]
+    ka, kb = k[:, :, :num_heads], k[:, :, num_heads:]
+    va, vb = v[:, :, :num_heads], v[:, :, num_heads:]
+
+    # head dimensions.
+    dim_k = kb.shape[-1]
+    dim_v = vb.shape[-1]
 
     block_q = min(block_q, q_len)
     block_kv = min(block_kv, k_len)
     block_h = min(block_h, num_heads)
+
+    assert q_len % block_q == 0, (q_len, block_q)
+    assert k_len % block_kv == 0, (k_len, block_kv)
 
     return pl.pallas_call(
         functools.partial(

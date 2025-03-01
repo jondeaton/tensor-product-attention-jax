@@ -103,8 +103,8 @@ def test_ring_attention_forward(
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
         num_heads=h,
-        debug=True,
+        debug=False,
         interpret=True,
     )
-
+    assert out.shape == (batch_size, lq, h, dv), out_ref.shape
     np.testing.assert_allclose(out, out_ref, rtol=1e-3, atol=1e-3)
