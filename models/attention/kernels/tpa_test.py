@@ -1,4 +1,7 @@
-"""Tests"""
+"""Tests for Tensor Product Attention.
+
+uv run python -m pytest -s --pdb models/attention/kernels/tpa_test.py
+"""
 
 import pytest
 import os
@@ -38,9 +41,13 @@ def reference(
     batch_size, lq, rq, _ = qa.shape
     _, lk, rk, _ = ka.shape
 
-    bb = einops.einsum(qb, kb, " b lq rq d, b lk rk d -> b lq lk rq rk")
-    x = einops.einsum(qa, ka, bb, "b lq rq h, b lk rk h, b lq lk rq rk -> b h lq lk")
-    x *= sm_scale / (rq * rk)
+    # just test by fully forming q,k,v
+    q_ = einops.einsum(qa, qb, "b lq rq h, b lq rq dk -> b lq h dk") / rq
+    k_ = einops.einsum(ka, kb, "b lk rk h, b lk rk dk -> b lk h dk") / rk
+    v_ = einops.einsum(va, vb, "b lk rk h, b lk rk dv -> b lk h dv") / rk
+
+    x = einops.einsum(q_, k_, "b lq h dk, b lk h dk -> b h lq lk")
+    x *= sm_scale
 
     segment_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
     x += jnp.where(segment_mask[:, None, :, :], 0, -jnp.inf)
@@ -52,20 +59,37 @@ def reference(
     p = jax.nn.softmax(x, axis=-1)
     assert p.shape == (batch_size, num_heads, lq, lk)
 
-    return einops.einsum(p, va, vb, "b h lq lk, b lk rk h, b lk rk dv -> b lq h dv")
+    return einops.einsum(p, v_, "b h lq lk, b lk h dv -> b lq h dv")
+
+
+def mha_jax(
+    q: Float[Array, "b lq h dk"],
+    k: Float[Array, "b lk h dk"],
+    v: Float[Array, "b lk h dv"],
+    sm_scale: Float[Array, "b lq"],
+    bias: Float[Array, "b lq lk"] | None = None,
+) -> Float[Array, "b lq h dv"]:
+    """Batched multi-head attention."""
+    qk = einops.einsum(q, k, "b lq h dk, b lk h dk -> b h lq lk")
+    qk *= sm_scale[:, None, :, None]
+    if bias is not None:
+        qk += bias
+    p = jax.nn.softmax(qk, axis=-1)
+    return einops.einsum(p, v, "b h lq lk, b lk h dv -> b lq h dv")
 
 
 @pytest.mark.parametrize("rank_q", [1, 2, 6])
 @pytest.mark.parametrize("rank_k", [1, 2, 4])
 @pytest.mark.parametrize(
-    "lq,lk,h,dk,dv",
+    "batch_size,lq,lk,h,dk,dv",
     [
-        (8, 8, 1, 4, 6),
-        (1024, 128, 4, 32, 8),
-        (128, 1024, 4, 32, 8),
+        (1, 8, 8, 1, 4, 6),
+        (2, 1024, 128, 4, 32, 8),
+        (2, 128, 1024, 4, 32, 8),
     ],
 )
 def test_ring_attention_forward(
+    batch_size: int,
     rank_q: int,
     rank_k: int,
     lq: int,
@@ -76,8 +100,6 @@ def test_ring_attention_forward(
 ):
     key = jax.random.PRNGKey(0)
     keys = jax.random.split(key, 3)
-
-    batch_size = 2
 
     q = jax.random.normal(keys[0], shape=(batch_size, lq, rank_q, (h + dk)))
     k = jax.random.normal(keys[0], shape=(batch_size, lk, rank_k, (h + dk)))

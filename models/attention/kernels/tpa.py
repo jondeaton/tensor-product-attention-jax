@@ -13,7 +13,7 @@ from jax.experimental import pallas as pl
 from jaxtyping import Int, Float, Array
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9))
 def tpa(
     q: Float[Array, "b lq rq (h + dh)"],
     k: Float[Array, "b lk rk (h + dh)"],
@@ -26,11 +26,52 @@ def tpa(
     debug: bool = False,
     interpret: bool = False,
 ) -> Float[Array, "b lq h dv"]:
-    """Tensor Product Attention kernel."""
-    batch_size, q_len, rank_q, dim_k = q.shape
-    _, k_len, rank_k, dim_v = v.shape
+    """Tensor Product Attention kernel.
 
-    o, _ = jax.vmap(  # over batch
+    Args:
+        q: query factors concatneated along final dimension.
+        k: key factors concatneated along final dimension.
+        v: value factors concatneated along final dimension.
+        q_segment_ids: query segment ids for packed samples.
+        kv_segment_ids: key/value segment ids for packed samples.
+        num_heads: number of attention heads.
+        sm_scale: softmax scaling factor.
+        causal: whether to apply causal attention mask.
+        debug/interpret: debug flags for Pallas.
+    Returns:
+        Attention output array.
+    """
+    o, _ = _tpa_fwd(
+        q,
+        k,
+        v,
+        q_segment_ids=q_segment_ids,
+        kv_segment_ids=kv_segment_ids,
+        num_heads=num_heads,
+        sm_scale=sm_scale,
+        causal=causal,
+        debug=debug,
+        interpret=interpret,
+    )
+    return o
+
+
+def _tpa_fwd(
+    q: Float[Array, "b lq rq (h + dk)"],
+    k: Float[Array, "b lk rk (h + dk)"],
+    v: Float[Array, "b lk rk (h + dv)"],
+    q_segment_ids: Int[Array, "b lq"],
+    kv_segment_ids: Int[Array, "b lk"],
+    num_heads: int,
+    sm_scale: Float,
+    causal: bool = False,
+    debug: bool = False,
+    interpret: bool = False,
+) -> tuple[
+    Float[Array, "b lq h dv"],
+    tuple[Array, ...],
+]:
+    o, l = jax.vmap(  # over batch
         functools.partial(
             _fwd,
             num_heads=num_heads,
@@ -42,16 +83,48 @@ def tpa(
         in_axes=[0, 0, 0, 0, 0],
         out_axes=0,
     )(q, k, v, q_segment_ids, kv_segment_ids)
-    return o
+    res = q, k, v, q_segment_ids, kv_segment_ids, o, l
+    return o, res
 
 
-def lse(x: jax.Array) -> jax.Array:
-    """Log sum exp."""
-    m = jnp.max(x, axis=-1)
-    return m + jnp.log(jnp.sum(jnp.exp(x - m[..., None]), axis=-1))
+def _tpa_bwd(
+    num_heads: int,
+    sm_scale: float,
+    causal: bool,
+    debug: bool,
+    interpret: bool,
+    residuals: tuple[Array, ...],
+    do: Float[Array, "b lq h dv"],
+) -> tuple[
+    Float[Array, "b lq rq (h + dk)"],
+    Float[Array, "b lk rk (h + dk)"],
+    Float[Array, "b lk rk (h + dv)"],
+    None,
+    None,
+]:
+    """Backward pass implementation."""
+
+    q, k, v, q_segment_ids, kv_segment_ids, o, l = residuals
+
+    dq, dk, dv = jax.vmap(  # over batch
+        functools.partial(
+            _bwd,
+            num_heads=num_heads,
+            causal=causal,
+            sm_scale=sm_scale,
+            debug=debug,
+            interpret=interpret,
+        ),
+        in_axes=[0, 0, 0, 0, 0, 0, 0],
+        out_axes=0,
+    )(q, k, v, q_segment_ids, kv_segment_ids, o, l, do)
+    return dq, dk, dv, None, None
 
 
-def lse_combine(a: jax.Array, b: jax.Array) -> jax.Array:
+tpa.defvjp(_tpa_fwd, _tpa_bwd)
+
+
+def _lse_combine(a: jax.Array, b: jax.Array) -> jax.Array:
     """Combine LSE.
     a > b
     log(exp(a) + exp(b))
@@ -126,10 +199,7 @@ def _fwd_kernel(
         ka = ka_ref[kv_slice, slice(None), slice(None)]
         kb = kb_ref[kv_slice, slice(None), slice(None)]
 
-        # jax.debug.print("{x}", x=kb)
-
         bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-
         x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
         x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
         # x = einops.einsum(qa, ka, bb, "lq rq h, lk rk h, lq lk rk -> h lq lk")
@@ -148,7 +218,7 @@ def _fwd_kernel(
         l_ = m + jnp.log(jnp.sum(jnp.exp(x - m[..., None]), axis=-1))
         assert l_.shape == (block_h, block_q), l_.shape
 
-        l = lse_combine(l_prev, l_)
+        l = _lse_combine(l_prev, l_)
 
         log_p = x - l[..., None]
         p = jnp.exp(log_p)
@@ -160,7 +230,7 @@ def _fwd_kernel(
         o_ = einops.einsum(p, v, "h lq lk, lk h dv -> h lq dv")
         assert o_.shape == (block_h, block_q, dv), o_.shape
 
-        # honestly idk if this can fit into smem
+        # idk if this can fit into smem
         # pva = einops.einsum(p, va, "h lq lk, lk rk h -> h lq lk rk")
         # o_ = einops.einsum(pva, vb, "h lq lk rk, lk rk dv -> h lq dv")
 
@@ -201,7 +271,7 @@ def _fwd(
     Float[Array, "lq h dv"],
     Float[Array, "lq h"],
 ]:
-    """Forward pass through TPA.
+    """Tensor Product Attention forward.
 
     Args:
         ...
@@ -271,8 +341,29 @@ def _fwd(
     )(qa, qb, ka, kb, va, vb, q_segment_ids, kv_segment_ids)
 
 
-def _bwd(*args, **kwargs):
-    raise NotImplementedError("Backward pass not implemented.")
+def _bwd_kernel():
+    # ... = pl.program_id(0)
+    raise NotImplementedError()
 
 
-tpa.defvjp(_fwd, _bwd)
+def _bwd(
+    q: Float[Array, "lq rq (h + dk)"],
+    k: Float[Array, "lk rk (h + dk)"],
+    v: Float[Array, "lk rk (h + dv)"],
+    q_segment_ids: Int[Array, " lq"],
+    kv_segment_ids: Int[Array, " lk"],
+    o: Float[Array, "lq h dv"],
+    l: Float[Array, "lq h"],
+    do: Float[Array, "lq h dv"],
+    num_heads: int,
+    sm_scale: Float,
+    causal: bool = False,
+    debug: bool = False,
+    interpret: bool = False,
+) -> tuple[
+    Float[Array, "lq rq (h + dk)"],
+    Float[Array, "lk rk (h + dk)"],
+    Float[Array, "lk rk (h + dv)"],
+]:
+    # return pl.pallas_call()
+    raise NotImplementedError()
