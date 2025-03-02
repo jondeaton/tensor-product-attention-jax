@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import functools
-from typing import Any
-import einops
+import dataclasses
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+import einops
 from jaxtyping import Int, Float, Array
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9))
+@dataclasses.dataclass
+class BlockSizes:
+    # query and key/value length sizes.
+    block_q: int = 128
+    block_kv: int = 128
+    # Number of attention heads processes simultaneously, and therefor share the
+    # computation of query/key factor inner products.
+    block_h: int = 4
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10))
 def tpa(
     q: Float[Array, "b lq rq (h + dh)"],
     k: Float[Array, "b lk rk (h + dh)"],
@@ -23,6 +33,7 @@ def tpa(
     num_heads: int,
     sm_scale: float = 1.0,
     causal: bool = False,
+    block_sizes: BlockSizes | None = None,
     debug: bool = False,
     interpret: bool = False,
 ) -> Float[Array, "b lq h dv"]:
@@ -41,6 +52,9 @@ def tpa(
     Returns:
         Attention output array.
     """
+    if block_sizes is None:
+        block_sizes = BlockSizes()
+
     o, _ = _tpa_fwd(
         q,
         k,
@@ -50,6 +64,7 @@ def tpa(
         num_heads=num_heads,
         sm_scale=sm_scale,
         causal=causal,
+        block_sizes=block_sizes,
         debug=debug,
         interpret=interpret,
     )
@@ -64,9 +79,10 @@ def _tpa_fwd(
     kv_segment_ids: Int[Array, "b lk"],
     num_heads: int,
     sm_scale: Float,
-    causal: bool = False,
-    debug: bool = False,
-    interpret: bool = False,
+    causal: bool,
+    block_sizes: BlockSizes,
+    debug: bool,
+    interpret: bool,
 ) -> tuple[
     Float[Array, "b lq h dv"],
     tuple[Array, ...],
@@ -77,6 +93,7 @@ def _tpa_fwd(
             num_heads=num_heads,
             causal=causal,
             sm_scale=sm_scale,
+            block_sizes=block_sizes,
             debug=debug,
             interpret=interpret,
         ),
@@ -91,6 +108,7 @@ def _tpa_bwd(
     num_heads: int,
     sm_scale: float,
     causal: bool,
+    block_sizes: BlockSizes,
     debug: bool,
     interpret: bool,
     residuals: tuple[Array, ...],
@@ -112,6 +130,7 @@ def _tpa_bwd(
             num_heads=num_heads,
             causal=causal,
             sm_scale=sm_scale,
+            block_sizes=block_sizes,
             debug=debug,
             interpret=interpret,
         ),
@@ -261,17 +280,15 @@ def _fwd(
     kv_segment_ids: Int[Array, " lk"],
     num_heads: int,
     sm_scale: Float,
-    causal: bool = False,
-    block_q: int = 128,
-    block_kv: int = 128,
-    block_h: int = 4,
-    debug: bool = False,
-    interpret: bool = False,
+    causal: bool,
+    block_sizes: BlockSizes,
+    debug: bool,
+    interpret: bool,
 ) -> tuple[
     Float[Array, "lq h dv"],
     Float[Array, "lq h"],
 ]:
-    """Tensor Product Attention forward.
+    """Tensor Product Attention forward implementation.
 
     Args:
         ...
@@ -293,9 +310,9 @@ def _fwd(
     dim_k = kb.shape[-1]
     dim_v = vb.shape[-1]
 
-    block_q = min(block_q, q_len)
-    block_kv = min(block_kv, k_len)
-    block_h = min(block_h, num_heads)
+    block_q = min(block_sizes.block_q, q_len)
+    block_kv = min(block_sizes.block_kv, k_len)
+    block_h = min(block_sizes.block_h, num_heads)
 
     assert q_len % block_q == 0, (q_len, block_q)
     assert k_len % block_kv == 0, (k_len, block_kv)
@@ -357,13 +374,70 @@ def _bwd(
     do: Float[Array, "lq h dv"],
     num_heads: int,
     sm_scale: Float,
-    causal: bool = False,
-    debug: bool = False,
-    interpret: bool = False,
+    causal: bool,
+    block_sizes: BlockSizes,
+    debug: bool,
+    interpret: bool,
 ) -> tuple[
     Float[Array, "lq rq (h + dk)"],
     Float[Array, "lk rk (h + dk)"],
     Float[Array, "lk rk (h + dv)"],
 ]:
-    # return pl.pallas_call()
-    raise NotImplementedError()
+    q_len, rank_q, h_dk = q.shape
+    k_len, rank_k, h_dv = v.shape
+    assert k.shape == (k_len, rank_k, h_dk), k.shape
+
+    qa, qb = q[:, :, :num_heads], q[:, :, num_heads:]
+    ka, kb = k[:, :, :num_heads], k[:, :, num_heads:]
+    va, vb = v[:, :, :num_heads], v[:, :, num_heads:]
+
+    # head dimensions.
+    dim_k = kb.shape[-1]
+    dim_v = vb.shape[-1]
+
+    block_q = min(block_sizes.block_q, q_len)
+    block_kv = min(block_sizes.block_kv, k_len)
+    block_h = min(block_sizes.block_h, num_heads)
+
+    assert q_len % block_q == 0, (q_len, block_q)
+    assert k_len % block_kv == 0, (k_len, block_kv)
+
+    return pl.pallas_call(
+        functools.partial(
+            _fwd_kernel,
+            sm_scale=sm_scale,
+            causal=causal,
+            block_kv=block_kv,
+        ),
+        grid=(
+            pl.cdiv(num_heads, block_h),
+            pl.cdiv(q_len, block_q),
+        ),
+        in_specs=[
+            pl.BlockSpec((block_q, rank_q, block_h), lambda h, lq: (lq, 0, h)),  # qa
+            pl.BlockSpec((block_q, rank_q, dim_k), lambda _, lq: (lq, 0, 0)),  # qb
+            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # ka
+            pl.BlockSpec((k_len, rank_k, dim_k), lambda *_: (0, 0, 0)),  # kb
+            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # va
+            pl.BlockSpec((k_len, rank_k, dim_v), lambda *_: (0, 0, 0)),  # vb
+            pl.BlockSpec((block_q,), lambda _, lq: (lq,)),  # q_segment_ids
+            pl.BlockSpec((k_len,), lambda *_: (0,)),  # kv_segment_ids
+        ],
+        out_specs=[
+            pl.BlockSpec((block_q, block_h, dim_v), lambda h, lq: (lq, h, 0)),  # out
+            pl.BlockSpec((block_q, block_h), lambda h, lq: (lq, h)),  # lse
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct(shape=(q_len, num_heads, dim_v), dtype=q.dtype),  # out
+            jax.ShapeDtypeStruct(shape=(q_len, num_heads), dtype=jnp.float32),  # lse
+        ],
+        compiler_params=dict(
+            triton=dict(
+                num_warps=4 if dim_k <= 64 else 8,
+                num_stages=2,
+            )
+        ),
+        debug=debug,
+        interpret=interpret,
+        name="tpa_bwd",
+    )(qa, qb, ka, kb, va, vb, q_segment_ids, kv_segment_ids)
