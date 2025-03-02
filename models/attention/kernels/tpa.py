@@ -358,9 +358,121 @@ def _fwd(
     )(qa, qb, ka, kb, va, vb, q_segment_ids, kv_segment_ids)
 
 
-def _bwd_kernel():
-    # ... = pl.program_id(0)
-    raise NotImplementedError()
+def _bwd_kernel(
+    qa_ref: Float[Array, "lq rq h"],
+    qb_ref: Float[Array, "lq rq dk"],
+    ka_ref: Float[Array, "lk rk h"],
+    kb_ref: Float[Array, "lk rk dk"],
+    va_ref: Float[Array, "lk rk h"],
+    vb_ref: Float[Array, "lk rk dv"],
+    q_segment_ids_ref: Int[Array, " lq"],
+    kv_segment_ids_ref: Int[Array, " lk"],
+    o_ref: Float[Array, "lq h dv"],
+    l_ref: Float[Array, "lq h"],
+    do_ref: Float[Array, "lq h dv"],
+    delta_ref: Float[Array, "lq h"],
+    dqa_alias: Float[Array, "lq rq h"],
+    dqb_alias: Float[Array, "lq rq dk"],
+    # outputs
+    dqa_ref: Float[Array, "lq rq h"],
+    dqb_ref: Float[Array, "lq rq dk"],
+    dka_ref: Float[Array, "lk rk h"],
+    dkb_ref: Float[Array, "lk rk dk"],
+    dva_ref: Float[Array, "lk rk h"],
+    dvb_ref: Float[Array, "lk rk dv"],
+    # static
+    sm_scale: float,
+    causal: bool,
+    block_q: int,
+    block_kv: int,
+    block_h: int,
+):
+    del dqa_alias, dqb_alias
+
+    q_len, rank_q, _ = qa_ref.shape
+    k_len, rank_k, dim_k = kb_ref.shape
+    block_q, block_h, dim_v = o_ref.shape
+
+    start_k = pl.program_id(1)
+
+    dka = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=jnp.float32)
+    dkb = jnp.zeros(shape=[block_kv, rank_k, dim_k], dtype=jnp.float32)
+
+    dva = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=jnp.float32)
+    dvb = jnp.zeros(shape=[block_kv, rank_k, dim_v], dtype=jnp.float32)
+
+    ka = ka_ref[...]
+    kb = kb_ref[...]
+
+    va = va_ref[...]
+    vb = vb_ref[...]
+
+    kv_segment_ids = kv_segment_ids_ref[...]
+
+    def _fn(start_q: int, carry):
+        dka, dkb, dva, dvb = carry
+
+        q_slice = pl.dslice(start=start_q * block_q, size=block_q)
+
+        qa = pl.load(qa_ref, (q_slice, slice(None), slice(None)))
+        qb = pl.load(qb_ref, (q_slice, slice(None), slice(None)))
+        q_segment_ids = q_segment_ids_ref[...]
+
+        bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
+        x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
+        x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+        x *= sm_scale
+
+        mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
+        if causal:
+            span_q = start_q * block_q + jnp.arange(block_q)
+            span_k = start_k * block_kv + jnp.arange(block_kv)
+            causal_mask = span_q[:, None] >= span_k[None, :]
+            mask &= causal_mask
+        x = jnp.where(mask[None, ...], x, -jnp.inf)
+
+        l = pl.load(l_ref, (q_slice, slice(None)))
+        di = pl.load(delta_ref, (q_slice, slice(None)))
+        do = pl.load(do_ref, (q_slice, slice(None), slice(None)))
+
+        p: Float[Array, "h lq lk"] = jnp.exp(x - einops.rearrange(l, "lq h -> h lq 1"))
+
+        dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")  # TODO: don't mat?
+        dva += einops.einsum(dv, vb, "lk h dv, lk rk dv -> lk rk h")
+        dvb += einops.einsum(dv, va, "lk h dv, lk rk h -> lk rk dv")
+
+        dp = einops.repeat(-di, "lq h -> h lq lk", lk=k_len)
+        v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k  # TODO: no
+        dp += einops.einsum(do, v, "lq h dv, lk h dv -> h lq lk")
+
+        ds = p * dp
+        ds *= sm_scale
+
+        q = einops.einsum(qa, qb, "lq rq h, lq rk dk -> lq h dk") / rank_q  # TODO: no
+        dk = einops.einsum(ds, q, "h lq lk, lq h dk -> lk h dk")
+        dka = einops.einsum(dk, dkb, "lk h dk, lk rk dk -> lk rk h")
+        dkb = einops.einsum(dk, dka, "lk h dk, lk rk h -> lk rk dk")
+
+        k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k  # TODO: no
+        dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
+        dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h")
+        dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk")
+
+        pl.atomic_add(dqa_ref, (q_slice, slice(None), slice(None)), dqa)
+        pl.atomic_add(dqb_ref, (q_slice, slice(None), slice(None)), dqb)
+
+        return dka, dkb, dva, dvb
+
+    end = start_k if causal else q_len
+    num_blocks = pl.cdiv(end, block_q)
+
+    dka, dkb, dva, dvb = jax.lax.fori_loop(0, num_blocks, _fn, (dka, dkb, dva, dvb))
+
+    # Write outputs to HBM.
+    dka_ref[...] = dka.astype(dka_ref.dtype)
+    dkb_ref[...] = dkb.astype(dkb_ref.dtype)
+    dva_ref[...] = dva.astype(dva_ref.dtype)
+    dvb_ref[...] = dvb.astype(dvb_ref.dtype)
 
 
 def _bwd(
@@ -382,10 +494,14 @@ def _bwd(
     Float[Array, "lq rq (h + dk)"],
     Float[Array, "lk rk (h + dk)"],
     Float[Array, "lk rk (h + dv)"],
+    None,
+    None,
 ]:
     q_len, rank_q, h_dk = q.shape
     k_len, rank_k, h_dv = v.shape
     assert k.shape == (k_len, rank_k, h_dk), k.shape
+    assert h_dk > num_heads
+    assert h_dv > num_heads
 
     qa, qb = q[:, :, :num_heads], q[:, :, num_heads:]
     ka, kb = k[:, :, :num_heads], k[:, :, num_heads:]
@@ -402,37 +518,59 @@ def _bwd(
     assert q_len % block_q == 0, (q_len, block_q)
     assert k_len % block_kv == 0, (k_len, block_kv)
 
-    return pl.pallas_call(
+    delta = _precompute_delta(o, do, l, block_q, debug=debug, interpret=interpret)
+
+    # initialize dq and use input aliasing https://github.com/jax-ml/jax/discussions/23272
+    # since we'll be writing to dq in parallel with atomic_add
+    dqa = jnp.zeros_like(qa)
+    dqb = jnp.zeros_like(qb)
+
+    dqa, dqb, dka, dkb, dva, dvb = pl.pallas_call(
         functools.partial(
-            _fwd_kernel,
-            sm_scale=sm_scale,
-            causal=causal,
-            block_kv=block_kv,
+            _bwd_kernel, sm_scale=sm_scale, causal=causal, block_kv=block_kv
         ),
         grid=(
             pl.cdiv(num_heads, block_h),
-            pl.cdiv(q_len, block_q),
+            pl.cdiv(k_len, block_kv),
         ),
         in_specs=[
-            pl.BlockSpec((block_q, rank_q, block_h), lambda h, lq: (lq, 0, h)),  # qa
-            pl.BlockSpec((block_q, rank_q, dim_k), lambda _, lq: (lq, 0, 0)),  # qb
-            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # ka
-            pl.BlockSpec((k_len, rank_k, dim_k), lambda *_: (0, 0, 0)),  # kb
-            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # va
-            pl.BlockSpec((k_len, rank_k, dim_v), lambda *_: (0, 0, 0)),  # vb
-            pl.BlockSpec((block_q,), lambda _, lq: (lq,)),  # q_segment_ids
-            pl.BlockSpec((k_len,), lambda *_: (0,)),  # kv_segment_ids
+            pl.BlockSpec((q_len, rank_q, block_h), lambda h, lk: (0, 0, h)),  # qa
+            pl.BlockSpec((q_len, rank_q, dim_k), lambda _, lk: (0, 0, 0)),  # qb
+            pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # ka
+            pl.BlockSpec((block_kv, rank_k, dim_k), lambda _, lk: (lk, 0, 0)),  # kb
+            pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # va
+            pl.BlockSpec((block_kv, rank_k, dim_v), lambda _, lk: (lk, 0, 0)),  # vb
+            # control
+            pl.BlockSpec((q_len,), lambda _, lk: (0,)),  # q_segment_ids
+            pl.BlockSpec((block_kv,), lambda _, lk: (lk,)),  # kv_segment_ids
+            # outputs
+            pl.BlockSpec((q_len, block_h, dim_v), lambda h, lk: (0, h, 0)),  # o
+            pl.BlockSpec((q_len, block_h), lambda h, lk: (0, h)),  # l
+            pl.BlockSpec((q_len, block_h, dim_v), lambda h, lk: (0, h, 0)),  # do
+            pl.BlockSpec((q_len, block_h), lambda h, lk: (0, h)),  # delta
+            # aliases: dqa, dqb
+            pl.BlockSpec((block_q, rank_q, block_h), lambda h, lq: (lq, 0, h)),  # dqa
+            pl.BlockSpec((block_q, rank_q, dim_k), lambda _, lq: (lq, 0, 0)),  # dqb
         ],
         out_specs=[
-            pl.BlockSpec((block_q, block_h, dim_v), lambda h, lq: (lq, h, 0)),  # out
-            pl.BlockSpec((block_q, block_h), lambda h, lq: (lq, h)),  # lse
+            pl.BlockSpec((q_len, rank_q, block_h), lambda h, lk: (0, 0, h)),  # dqa
+            pl.BlockSpec((q_len, rank_q, dim_k), lambda _, lk: (0, 0, 0)),  # dqb
+            pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # dka
+            pl.BlockSpec((block_kv, rank_k, dim_k), lambda _, lk: (lk, 0, 0)),  # dkb
+            pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # dva
+            pl.BlockSpec((block_kv, rank_k, dim_v), lambda _, lk: (lk, 0, 0)),  # dvb
         ],
         out_shape=[
-            jax.ShapeDtypeStruct(shape=(q_len, num_heads, dim_v), dtype=q.dtype),  # out
-            jax.ShapeDtypeStruct(shape=(q_len, num_heads), dtype=jnp.float32),  # lse
+            jax.ShapeDtypeStruct(shape=qa.shape, dtype=qa.dtype),
+            jax.ShapeDtypeStruct(shape=qb.shape, dtype=qb.dtype),
+            jax.ShapeDtypeStruct(shape=ka.shape, dtype=ka.dtype),
+            jax.ShapeDtypeStruct(shape=kb.shape, dtype=kb.dtype),
+            jax.ShapeDtypeStruct(shape=va.shape, dtype=va.dtype),
+            jax.ShapeDtypeStruct(shape=vb.shape, dtype=vb.dtype),
         ],
+        input_output_aliases={12: 0, 13: 1},  # dqa, dqb
         compiler_params=dict(
-            triton=dict(
+            triton=dict(  # TODO: need to adjust this???
                 num_warps=4 if dim_k <= 64 else 8,
                 num_stages=2,
             )
@@ -440,4 +578,43 @@ def _bwd(
         debug=debug,
         interpret=interpret,
         name="tpa_bwd",
-    )(qa, qb, ka, kb, va, vb, q_segment_ids, kv_segment_ids)
+    )(qa, qb, ka, kb, va, vb, q_segment_ids, kv_segment_ids, o, l, do, delta)
+
+    dq = jnp.concatenate([dqa, dqb], axis=-1)
+    dk = jnp.concatenate([dka, dkb], axis=-1)
+    dv = jnp.concatenate([dva, dvb], axis=-1)
+
+    return dq, dk, dv, None, None
+
+
+def _precompute_delta(
+    out: Float[Array, "lq dv"],
+    do: Float[Array, "lq dv"],
+    lse: Float[Array, " lq"],
+    block_q: int,
+    debug: bool,
+    interpret: bool,
+) -> Float[Array, " lq"]:
+    """Precompute delta for backward pass."""
+    seq_len, dv = out.shape
+
+    def kernel(out_ref, dout_ref, delta_ref):
+        o = out_ref[...].astype(jnp.float32)
+        do = dout_ref[...].astype(jnp.float32)
+        delta = jnp.sum(o * do, axis=1)
+        delta_ref[...] = delta.astype(delta_ref.dtype)
+
+    return pl.pallas_call(
+        kernel,
+        grid=(pl.cdiv(seq_len, block_q),),
+        in_specs=[
+            pl.BlockSpec((block_q, dv), lambda l: (l, 0)),
+            pl.BlockSpec((block_q, dv), lambda l: (l, 0)),
+        ],
+        out_specs=pl.BlockSpec((block_q,), lambda l: (l,)),
+        compiler_params=dict(triton=dict(num_warps=4, num_stages=3)),
+        out_shape=jax.ShapeDtypeStruct(lse.shape, lse.dtype),
+        debug=debug,
+        interpret=interpret,
+        name="precompute_delta",
+    )(out, do)
