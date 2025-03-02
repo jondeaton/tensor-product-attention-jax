@@ -245,6 +245,7 @@ def _fwd_kernel(
         va = va_ref[kv_slice, slice(None), slice(None)]
         vb = vb_ref[kv_slice, slice(None), slice(None)]
 
+        # TODO: maybe its fine to materialize v in the kernel?
         v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
         o_ = einops.einsum(p, v, "h lq lk, lk h dv -> h lq dv")
         assert o_.shape == (block_h, block_q, dv), o_.shape
@@ -437,23 +438,23 @@ def _bwd_kernel(
 
         p: Float[Array, "h lq lk"] = jnp.exp(x - einops.rearrange(l, "lq h -> h lq 1"))
 
-        dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")  # TODO: don't mat?
+        dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")  # TODO: dont mat?
         dva += einops.einsum(dv, vb, "lk h dv, lk rk dv -> lk rk h")
         dvb += einops.einsum(dv, va, "lk h dv, lk rk h -> lk rk dv")
 
         dp = einops.repeat(-di, "lq h -> h lq lk", lk=k_len)
-        v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k  # TODO: no
+        v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k  # TODO: no?
         dp += einops.einsum(do, v, "lq h dv, lk h dv -> h lq lk")
 
         ds = p * dp
         ds *= sm_scale
 
-        q = einops.einsum(qa, qb, "lq rq h, lq rk dk -> lq h dk") / rank_q  # TODO: no
+        q = einops.einsum(qa, qb, "lq rq h, lq rk dk -> lq h dk") / rank_q  # TODO: no?
         dk = einops.einsum(ds, q, "h lq lk, lq h dk -> lk h dk")
         dka = einops.einsum(dk, dkb, "lk h dk, lk rk dk -> lk rk h")
         dkb = einops.einsum(dk, dka, "lk h dk, lk rk h -> lk rk dk")
 
-        k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k  # TODO: no
+        k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k  # TODO: no?
         dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
         dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h")
         dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk")
@@ -518,10 +519,13 @@ def _bwd(
     assert q_len % block_q == 0, (q_len, block_q)
     assert k_len % block_kv == 0, (k_len, block_kv)
 
-    delta = _precompute_delta(o, do, l, block_q, debug=debug, interpret=interpret)
+    delta = _precompute_delta(
+        o, do, l, block_q=block_q, debug=debug, interpret=interpret
+    )
 
     # initialize dq and use input aliasing https://github.com/jax-ml/jax/discussions/23272
     # since we'll be writing to dq in parallel with atomic_add
+    # NOTE: On GPU these will need to be float 32
     dqa = jnp.zeros_like(qa)
     dqb = jnp.zeros_like(qb)
 

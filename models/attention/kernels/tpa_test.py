@@ -88,7 +88,7 @@ def mha_jax(
         (2, 128, 1024, 4, 32, 8),
     ],
 )
-def test_ring_attention_forward(
+def test_tpa_forward(
     batch_size: int,
     rank_q: int,
     rank_k: int,
@@ -102,8 +102,8 @@ def test_ring_attention_forward(
     keys = jax.random.split(key, 3)
 
     q = jax.random.normal(keys[0], shape=(batch_size, lq, rank_q, (h + dk)))
-    k = jax.random.normal(keys[0], shape=(batch_size, lk, rank_k, (h + dk)))
-    v = jax.random.normal(keys[0], shape=(batch_size, lk, rank_k, (h + dv)))
+    k = jax.random.normal(keys[1], shape=(batch_size, lk, rank_k, (h + dk)))
+    v = jax.random.normal(keys[2], shape=(batch_size, lk, rank_k, (h + dv)))
 
     q_segment_ids = jnp.ones(shape=(batch_size, lq), dtype=int)
     kv_segment_ids = jnp.ones(shape=(batch_size, lk), dtype=int)
@@ -130,3 +130,68 @@ def test_ring_attention_forward(
     )
     assert out.shape == (batch_size, lq, h, dv), out_ref.shape
     np.testing.assert_allclose(out, out_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("rank_q", [1, 2, 6])
+@pytest.mark.parametrize("rank_k", [1, 2, 4])
+@pytest.mark.parametrize(
+    "batch_size,lq,lk,h,dk,dv",
+    [
+        (1, 8, 8, 1, 4, 6),
+        (2, 1024, 128, 4, 32, 8),
+        (2, 128, 1024, 4, 32, 8),
+    ],
+)
+def test_tpa_backwards(
+    batch_size: int,
+    rank_q: int,
+    rank_k: int,
+    lq: int,
+    lk: int,
+    h: int,
+    dk: int,
+    dv: int,
+):
+    key = jax.random.PRNGKey(0)
+    keys = jax.random.split(key, 4)
+
+    q = jax.random.normal(keys[0], shape=(batch_size, lq, rank_q, (h + dk)))
+    k = jax.random.normal(keys[1], shape=(batch_size, lk, rank_k, (h + dk)))
+    v = jax.random.normal(keys[2], shape=(batch_size, lk, rank_k, (h + dv)))
+
+    q_segment_ids = jnp.ones(shape=(batch_size, lq), dtype=int)
+    kv_segment_ids = jnp.ones(shape=(batch_size, lk), dtype=int)
+
+    do = jax.random.normal(keys[4], shape=(batch_size, lq, h, dv))
+
+    def _ref(q, k, v):
+        return do * reference(
+            q,
+            k,
+            v,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            num_heads=h,
+            causal=False,
+        )
+
+    dq_, dk_, dv_ = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v)
+
+    dq, dk, dv = jax.grad(
+        lambda q, k, v: jnp.sum(
+            do
+            * tpa.tpa(
+                q,
+                k,
+                v,
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids,
+                causal=False,
+            )
+        ),
+        argnums=(0, 1, 2),
+    )(q, k, v)
+
+    np.testing.assert_allclose(dq, dq_, atol=1e-4)
+    np.testing.assert_allclose(dk, dk_, atol=1e-4)
+    np.testing.assert_allclose(dv, dv_, atol=1e-4)
