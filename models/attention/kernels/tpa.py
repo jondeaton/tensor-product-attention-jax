@@ -444,6 +444,7 @@ def _bwd_kernel(
 
     # TODO: avoid materializing in the nomat case...?
     k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
+    v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
 
     def _fn(start_q: int, carry):
         dka, dkb, dva, dvb = carry
@@ -452,15 +453,16 @@ def _bwd_kernel(
 
         qa = pl.load(qa_ref, (q_slice, slice(None), slice(None)))
         qb = pl.load(qb_ref, (q_slice, slice(None), slice(None)))
-        q_segment_ids = q_segment_ids_ref[...]
-        if nomat:
-            bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-            x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
-            x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
-        else:
-            assert k is not None
-            q = einops.einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
-            x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
+        q_segment_ids = pl.load(q_segment_ids_ref, (q_slice,))
+
+        q = einops.einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
+
+        # TODOO: handle nomat case
+        # if nomat:
+        #     bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
+        #     x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
+        #     x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+        x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
 
         assert x is not None
 
@@ -474,32 +476,30 @@ def _bwd_kernel(
             mask &= causal_mask
         x = jnp.where(mask[None, ...], x, -jnp.inf)
 
+        # TODO: simplify laoding with brackets l = l_ref[q_slice, ...]
         l = pl.load(l_ref, (q_slice, slice(None)))
         di = pl.load(delta_ref, (q_slice, slice(None)))
         do = pl.load(do_ref, (q_slice, slice(None), slice(None)))
 
         p: Float[Array, "h lq lk"] = jnp.exp(x - einops.rearrange(l, "lq h -> h lq 1"))
 
-        dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")  # TODO: dont mat?
-        dva += einops.einsum(dv, vb, "lk h dv, lk rk dv -> lk rk h")
-        dvb += einops.einsum(dv, va, "lk h dv, lk rk h -> lk rk dv")
+        dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")  # TODO: avoid mat?
+        dva += einops.einsum(dv, vb, "lk h dv, lk rk dv -> lk rk h") / rank_k
+        dvb += einops.einsum(dv, va, "lk h dv, lk rk h -> lk rk dv") / rank_k
 
         dp = einops.repeat(-di, "lq h -> h lq lk", lk=k_len)
-        v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k  # TODO: no?
         dp += einops.einsum(do, v, "lq h dv, lk h dv -> h lq lk")
 
         ds = p * dp
         ds *= sm_scale
 
-        q = einops.einsum(qa, qb, "lq rq h, lq rk dk -> lq h dk") / rank_q  # TODO: no?
         dk = einops.einsum(ds, q, "h lq lk, lq h dk -> lk h dk")
-        dka = einops.einsum(dk, dkb, "lk h dk, lk rk dk -> lk rk h")
-        dkb = einops.einsum(dk, dka, "lk h dk, lk rk h -> lk rk dk")
+        dka = einops.einsum(dk, kb, "lk h dk, lk rk dk -> lk rk h") / rank_k
+        dkb = einops.einsum(dk, ka, "lk h dk, lk rk h -> lk rk dk") / rank_k
 
-        # k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k  # TODO: no?
         dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
-        dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h")
-        dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk")
+        dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
+        dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
 
         pl.atomic_add(dqa_ref, (q_slice, slice(None), slice(None)), dqa)
         pl.atomic_add(dqb_ref, (q_slice, slice(None), slice(None)), dqb)
