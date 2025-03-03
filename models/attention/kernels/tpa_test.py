@@ -55,6 +55,7 @@ def reference(
     where_none = jnp.isnan(p).all(axis=-1)
     p = p.at[where_none].set(0)
 
+    # TODO: use jnp.nansum in grad instead
     o = einops.einsum(p, v_, "b h lq lk, b lk h dv -> b lq h dv")
 
     where_none = einops.rearrange(where_none, "b h lq -> b lq h")

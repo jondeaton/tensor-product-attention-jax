@@ -457,9 +457,9 @@ def _bwd_kernel(
 
         q_slice = pl.dslice(start=start_q * block_q, size=block_q)
 
-        qa = pl.load(qa_ref, (q_slice, slice(None), slice(None)))
-        qb = pl.load(qb_ref, (q_slice, slice(None), slice(None)))
-        q_segment_ids = pl.load(q_segment_ids_ref, (q_slice,))
+        qa = qa_ref[q_slice, ...]
+        qb = qb_ref[q_slice, ...]
+        q_segment_ids = q_segment_ids_ref[q_slice]
 
         q = einops.einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
 
@@ -482,10 +482,9 @@ def _bwd_kernel(
             mask &= causal_mask
         x = jnp.where(mask[None, ...], x, -jnp.inf)
 
-        # TODO: simplify laoding with brackets l = l_ref[q_slice, ...]
-        l = pl.load(l_ref, (q_slice, slice(None)))
-        di = pl.load(delta_ref, (q_slice, slice(None)))
-        do = pl.load(do_ref, (q_slice, slice(None), slice(None)))
+        l = l_ref[q_slice, ...]
+        do = do_ref[q_slice, ...]
+        di = delta_ref[q_slice, ...]
 
         l = einops.rearrange(l, "lq h -> h lq 1")
         p: Float[Array, "h lq lk"] = jnp.exp(x - l)
