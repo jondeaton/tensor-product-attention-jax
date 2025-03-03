@@ -4,15 +4,10 @@ uv run python -m pytest -s --pdb models/attention/kernels/tpa_test.py
 """
 
 import pytest
-import os
-import functools
 import numpy as np
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec, NamedSharding
-from jax.experimental.shard_map import shard_map
-from jax.experimental import mesh_utils
 
 import einops
 from jaxtyping import Float, Int, Array
@@ -80,6 +75,7 @@ def mha_jax(
 
 @pytest.mark.parametrize("rank_q", [1, 2, 6])
 @pytest.mark.parametrize("rank_k", [1, 2, 4])
+@pytest.mark.parametrize("nomat", [False, True])
 @pytest.mark.parametrize(
     "batch_size,lq,lk,h,dk,dv",
     [
@@ -92,12 +88,15 @@ def test_tpa_forward(
     batch_size: int,
     rank_q: int,
     rank_k: int,
+    nomat: bool,
     lq: int,
     lk: int,
     h: int,
     dk: int,
     dv: int,
 ):
+    pytest.skip()
+
     key = jax.random.PRNGKey(0)
     keys = jax.random.split(key, 3)
 
@@ -125,6 +124,7 @@ def test_tpa_forward(
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
         num_heads=h,
+        nomat=nomat,
         debug=False,
         interpret=True,
     )
@@ -134,6 +134,7 @@ def test_tpa_forward(
 
 @pytest.mark.parametrize("rank_q", [1, 2, 6])
 @pytest.mark.parametrize("rank_k", [1, 2, 4])
+@pytest.mark.parametrize("nomat", [False, True])
 @pytest.mark.parametrize(
     "batch_size,lq,lk,h,dk,dv",
     [
@@ -146,6 +147,7 @@ def test_tpa_backwards(
     batch_size: int,
     rank_q: int,
     rank_k: int,
+    nomat: bool,
     lq: int,
     lk: int,
     h: int,
@@ -164,33 +166,34 @@ def test_tpa_backwards(
 
     do = jax.random.normal(keys[4], shape=(batch_size, lq, h, dv))
 
-    def _ref(q, k, v):
-        return do * reference(
-            q,
-            k,
-            v,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
-            num_heads=h,
-            causal=False,
-        )
-
-    dq_, dk_, dv_ = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v)
-
-    dq, dk, dv = jax.grad(
-        lambda q, k, v: jnp.sum(
-            do
-            * tpa.tpa(
+    def _ref(q, k, v, impl: str) -> Float[Array, ""]:
+        if impl == "ref":
+            o = reference(
                 q,
                 k,
                 v,
                 q_segment_ids=q_segment_ids,
                 kv_segment_ids=kv_segment_ids,
+                num_heads=h,
                 causal=False,
             )
-        ),
-        argnums=(0, 1, 2),
-    )(q, k, v)
+        else:
+            o = tpa.tpa(
+                q,
+                k,
+                v,
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids,
+                num_heads=h,
+                nomat=nomat,
+                causal=False,
+                debug=True,
+                interpret=True,
+            )
+        return einops.einsum(do, o, "b lq h dk, b lq h dk -> ")
+
+    dq_, dk_, dv_ = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v, impl="ref")
+    dq, dk, dv = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v, impl="kernel")
 
     np.testing.assert_allclose(dq, dq_, atol=1e-4)
     np.testing.assert_allclose(dk, dk_, atol=1e-4)

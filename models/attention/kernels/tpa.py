@@ -15,15 +15,15 @@ from jaxtyping import Int, Float, Array
 
 @dataclasses.dataclass
 class BlockSizes:
-    # query and key/value length sizes.
+    # query and key/value block length sizes.
     block_q: int = 128
     block_kv: int = 128
-    # Number of attention heads processes simultaneously, and therefor share the
-    # computation of query/key factor inner products.
+    # Number of attention heads processes simultaneously, and thus share computation of
+    # query/key factor inner products.
     block_h: int = 4
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
 def tpa(
     q: Float[Array, "b lq rq (h + dh)"],
     k: Float[Array, "b lk rk (h + dh)"],
@@ -34,10 +34,11 @@ def tpa(
     sm_scale: float = 1.0,
     causal: bool = False,
     block_sizes: BlockSizes | None = None,
+    nomat: bool = False,
     debug: bool = False,
     interpret: bool = False,
 ) -> Float[Array, "b lq h dv"]:
-    """Tensor Product Attention kernel.
+    """Tensor Product Attention - as Pallas kernel.
 
     Args:
         q: query factors concatneated along final dimension.
@@ -48,13 +49,14 @@ def tpa(
         num_heads: number of attention heads.
         sm_scale: softmax scaling factor.
         causal: whether to apply causal attention mask.
+        block_sizes: query/key/heads block sizes for partitioning works amongst threads.
+        nomat: whether to avoid materializing query/key arrays even in the kernel. This
+            strategy uses more memory in SRAM to reduce total FLOPS by sharing query/key
+            inner products amongst heads in the same block.
         debug/interpret: debug flags for Pallas.
     Returns:
         Attention output array.
     """
-    if block_sizes is None:
-        block_sizes = BlockSizes()
-
     o, _ = _tpa_fwd(
         q,
         k,
@@ -65,6 +67,7 @@ def tpa(
         sm_scale=sm_scale,
         causal=causal,
         block_sizes=block_sizes,
+        nomat=nomat,
         debug=debug,
         interpret=interpret,
     )
@@ -80,13 +83,17 @@ def _tpa_fwd(
     num_heads: int,
     sm_scale: Float,
     causal: bool,
-    block_sizes: BlockSizes,
+    block_sizes: BlockSizes | None,
+    nomat: bool,
     debug: bool,
     interpret: bool,
 ) -> tuple[
     Float[Array, "b lq h dv"],
     tuple[Array, ...],
 ]:
+    if block_sizes is None:
+        block_sizes = BlockSizes()
+
     o, l = jax.vmap(  # over batch
         functools.partial(
             _fwd,
@@ -94,6 +101,7 @@ def _tpa_fwd(
             causal=causal,
             sm_scale=sm_scale,
             block_sizes=block_sizes,
+            nomat=nomat,
             debug=debug,
             interpret=interpret,
         ),
@@ -108,7 +116,8 @@ def _tpa_bwd(
     num_heads: int,
     sm_scale: float,
     causal: bool,
-    block_sizes: BlockSizes,
+    block_sizes: BlockSizes | None,
+    nomat: bool,
     debug: bool,
     interpret: bool,
     residuals: tuple[Array, ...],
@@ -121,6 +130,8 @@ def _tpa_bwd(
     None,
 ]:
     """Backward pass implementation."""
+    if block_sizes is None:
+        block_sizes = BlockSizes()
 
     q, k, v, q_segment_ids, kv_segment_ids, o, l = residuals
 
@@ -131,10 +142,11 @@ def _tpa_bwd(
             causal=causal,
             sm_scale=sm_scale,
             block_sizes=block_sizes,
+            nomat=nomat,
             debug=debug,
             interpret=interpret,
         ),
-        in_axes=[0, 0, 0, 0, 0, 0, 0],
+        in_axes=[0, 0, 0, 0, 0, 0, 0, 0],
         out_axes=0,
     )(q, k, v, q_segment_ids, kv_segment_ids, o, l, do)
     return dq, dk, dv, None, None
@@ -171,6 +183,7 @@ def _fwd_kernel(
     sm_scale: float,
     causal: bool,
     block_kv: int,
+    nomat: bool,
 ):
     """TPA forward pallas kernel.
 
@@ -195,6 +208,7 @@ def _fwd_kernel(
         sm_scale: softmax scale
         causal: whether to apply a causal kernel.
         block_kv: block size to split key/value arrays
+        nomat: whether to avoid materializing q and k.
 
     Returns:
         nothing its a kernel.
@@ -208,6 +222,11 @@ def _fwd_kernel(
     qb = qb_ref[...]
     q_segment_ids = q_segment_ids_ref[...]
 
+    if not nomat:
+        q = einops.einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
+    else:
+        q = None
+
     def _scan_fn(start_k: int, carry):
         o, l_prev = carry
         assert o.shape == (block_h, block_q, dv), o.shape
@@ -218,10 +237,20 @@ def _fwd_kernel(
         ka = ka_ref[kv_slice, slice(None), slice(None)]
         kb = kb_ref[kv_slice, slice(None), slice(None)]
 
-        bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-        x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
-        x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
-        # x = einops.einsum(qa, ka, bb, "lq rq h, lk rk h, lq lk rk -> h lq lk")
+        if nomat:
+            # NOTE: this strategy uses more SRAM per block but reduces the amount of
+            # flops by sharding query/key inner products amongst heads.
+            bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
+            x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
+            x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+            # x = einops.einsum(qa, ka, bb, "lq rq h, lk rk h, lq lk rk -> h lq lk")
+        else:
+            # NOTE: this strategy materializes q and k in the highest memory cache
+            # but still avoids materializing them in HBM.
+            k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
+            x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
+        assert x is not None
+
         x *= sm_scale
 
         kv_segment_ids = kv_segment_ids_ref[kv_slice]
@@ -283,6 +312,7 @@ def _fwd(
     sm_scale: Float,
     causal: bool,
     block_sizes: BlockSizes,
+    nomat: bool,
     debug: bool,
     interpret: bool,
 ) -> tuple[
@@ -324,6 +354,7 @@ def _fwd(
             sm_scale=sm_scale,
             causal=causal,
             block_kv=block_kv,
+            nomat=nomat,
         ),
         grid=(
             pl.cdiv(num_heads, block_h),
@@ -387,6 +418,7 @@ def _bwd_kernel(
     block_q: int,
     block_kv: int,
     block_h: int,
+    nomat: bool,
 ):
     del dqa_alias, dqb_alias
 
@@ -410,6 +442,9 @@ def _bwd_kernel(
 
     kv_segment_ids = kv_segment_ids_ref[...]
 
+    # TODO: avoid materializing in the nomat case...?
+    k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
+
     def _fn(start_q: int, carry):
         dka, dkb, dva, dvb = carry
 
@@ -418,10 +453,17 @@ def _bwd_kernel(
         qa = pl.load(qa_ref, (q_slice, slice(None), slice(None)))
         qb = pl.load(qb_ref, (q_slice, slice(None), slice(None)))
         q_segment_ids = q_segment_ids_ref[...]
+        if nomat:
+            bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
+            x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
+            x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+        else:
+            assert k is not None
+            q = einops.einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
+            x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
 
-        bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-        x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
-        x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+        assert x is not None
+
         x *= sm_scale
 
         mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
@@ -454,7 +496,7 @@ def _bwd_kernel(
         dka = einops.einsum(dk, dkb, "lk h dk, lk rk dk -> lk rk h")
         dkb = einops.einsum(dk, dka, "lk h dk, lk rk h -> lk rk dk")
 
-        k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k  # TODO: no?
+        # k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k  # TODO: no?
         dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
         dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h")
         dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk")
@@ -489,14 +531,13 @@ def _bwd(
     sm_scale: Float,
     causal: bool,
     block_sizes: BlockSizes,
+    nomat: bool,
     debug: bool,
     interpret: bool,
 ) -> tuple[
     Float[Array, "lq rq (h + dk)"],
     Float[Array, "lk rk (h + dk)"],
     Float[Array, "lk rk (h + dv)"],
-    None,
-    None,
 ]:
     q_len, rank_q, h_dk = q.shape
     k_len, rank_k, h_dv = v.shape
@@ -519,9 +560,16 @@ def _bwd(
     assert q_len % block_q == 0, (q_len, block_q)
     assert k_len % block_kv == 0, (k_len, block_kv)
 
-    delta = _precompute_delta(
-        o, do, l, block_q=block_q, debug=debug, interpret=interpret
-    )
+    delta = jax.vmap(
+        functools.partial(
+            _precompute_delta,
+            block_q=block_q,
+            debug=debug,
+            interpret=interpret,
+        ),
+        in_axes=[0, 0, 0],
+        out_axes=0,
+    )(o, do, l)
 
     # initialize dq and use input aliasing https://github.com/jax-ml/jax/discussions/23272
     # since we'll be writing to dq in parallel with atomic_add
@@ -531,7 +579,13 @@ def _bwd(
 
     dqa, dqb, dka, dkb, dva, dvb = pl.pallas_call(
         functools.partial(
-            _bwd_kernel, sm_scale=sm_scale, causal=causal, block_kv=block_kv
+            _bwd_kernel,
+            sm_scale=sm_scale,
+            causal=causal,
+            block_q=block_q,
+            block_kv=block_kv,
+            block_h=block_h,
+            nomat=nomat,
         ),
         grid=(
             pl.cdiv(num_heads, block_h),
@@ -582,13 +636,13 @@ def _bwd(
         debug=debug,
         interpret=interpret,
         name="tpa_bwd",
-    )(qa, qb, ka, kb, va, vb, q_segment_ids, kv_segment_ids, o, l, do, delta)
+    )(qa, qb, ka, kb, va, vb, q_segment_ids, kv_segment_ids, o, l, do, delta, dqa, dqb)
 
     dq = jnp.concatenate([dqa, dqb], axis=-1)
     dk = jnp.concatenate([dka, dkb], axis=-1)
     dv = jnp.concatenate([dva, dvb], axis=-1)
 
-    return dq, dk, dv, None, None
+    return dq, dk, dv
 
 
 def _precompute_delta(
