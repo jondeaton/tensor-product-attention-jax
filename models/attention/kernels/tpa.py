@@ -155,6 +155,13 @@ def _tpa_bwd(
 tpa.defvjp(_tpa_fwd, _tpa_bwd)
 
 
+def _lse(x: jax.Array):
+    """Logsumexp over final dimension."""
+    m = jnp.max(x, axis=-1)
+    l_ = m + jnp.log(jnp.sum(jnp.exp(x - m[..., None]), axis=-1))
+    return jnp.where(jnp.isneginf(m), -jnp.inf, l_)
+
+
 def _lse_combine(a: jax.Array, b: jax.Array) -> jax.Array:
     """Combine LSE.
     a > b
@@ -166,7 +173,8 @@ def _lse_combine(a: jax.Array, b: jax.Array) -> jax.Array:
     assert a.shape == b.shape, f"mismatching shapes: {a.shape}, {b.shape}"
     max = jnp.maximum(a, b)
     min = jnp.minimum(a, b)
-    return max + jnp.log(1 + jnp.exp(min - max))
+    lse = max + jnp.log(1 + jnp.exp(min - max))
+    return jnp.where(jnp.isneginf(max), -jnp.inf, lse)
 
 
 def _fwd_kernel(
@@ -262,14 +270,12 @@ def _fwd_kernel(
             mask &= causal_mask
         x = jnp.where(mask[None, ...], x, -jnp.inf)
 
-        m = jnp.max(x, axis=-1)
-        l_ = m + jnp.log(jnp.sum(jnp.exp(x - m[..., None]), axis=-1))
-        assert l_.shape == (block_h, block_q), l_.shape
-
-        l = _lse_combine(l_prev, l_)
+        # TODO: these two operaitons can probably be combined into one.
+        l: Float[Array, "h lq"] = _lse_combine(l_prev, _lse(x))
 
         log_p = x - l[..., None]
         p = jnp.exp(log_p)
+        p = jnp.where(jnp.isneginf(l[..., None]), 0.0, p)  # no data yet -> zero.
 
         va = va_ref[kv_slice, slice(None), slice(None)]
         vb = vb_ref[kv_slice, slice(None), slice(None)]
@@ -481,7 +487,9 @@ def _bwd_kernel(
         di = pl.load(delta_ref, (q_slice, slice(None)))
         do = pl.load(do_ref, (q_slice, slice(None), slice(None)))
 
-        p: Float[Array, "h lq lk"] = jnp.exp(x - einops.rearrange(l, "lq h -> h lq 1"))
+        l = einops.rearrange(l, "lq h -> h lq 1")
+        p: Float[Array, "h lq lk"] = jnp.exp(x - l)
+        p = jnp.where(jnp.isneginf(l), 0, p)
 
         dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")  # TODO: avoid mat?
         dva += einops.einsum(dv, vb, "lk h dv, lk rk dv -> lk rk h") / rank_k

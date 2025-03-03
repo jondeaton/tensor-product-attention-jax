@@ -36,7 +36,7 @@ def reference(
     batch_size, lq, rq, _ = qa.shape
     _, lk, rk, _ = ka.shape
 
-    # just test by fully forming q,k,v
+    # easiest implementation is fully materialize q,k,v
     q_ = einops.einsum(qa, qb, "b lq rq h, b lq rq dk -> b lq h dk") / rq
     k_ = einops.einsum(ka, kb, "b lk rk h, b lk rk dk -> b lk h dk") / rk
     v_ = einops.einsum(va, vb, "b lk rk h, b lk rk dv -> b lk h dv") / rk
@@ -52,9 +52,13 @@ def reference(
         x += jnp.where(mask, 0, -jnp.inf)
 
     p = jax.nn.softmax(x, axis=-1)
-    assert p.shape == (batch_size, num_heads, lq, lk)
+    where_none = jnp.isnan(p).all(axis=-1)
+    p = p.at[where_none].set(0)
 
-    return einops.einsum(p, v_, "b h lq lk, b lk h dv -> b lq h dv")
+    o = einops.einsum(p, v_, "b h lq lk, b lk h dv -> b lq h dv")
+
+    where_none = einops.rearrange(where_none, "b h lq -> b lq h")
+    return o.at[where_none].set(jnp.nan)
 
 
 def mha_jax(
@@ -102,8 +106,8 @@ def test_tpa_forward(
     k = jax.random.uniform(keys[1], shape=(batch_size, lk, rank_k, (h + dk)))
     v = jax.random.uniform(keys[2], shape=(batch_size, lk, rank_k, (h + dv)))
 
-    q_segment_ids = jnp.ones(shape=(batch_size, lq), dtype=int)
-    kv_segment_ids = jnp.ones(shape=(batch_size, lk), dtype=int)
+    q_segment_ids = einops.repeat(jnp.arange(lq) // 42, "l -> b l", b=batch_size)
+    kv_segment_ids = einops.repeat(jnp.arange(lk) // 42, "l -> b l", b=batch_size)
 
     out_ref = reference(
         q,
@@ -159,8 +163,8 @@ def test_tpa_backwards(
     k = jax.random.uniform(keys[1], shape=(batch_size, lk, rank_k, (h + dim_k)))
     v = jax.random.uniform(keys[2], shape=(batch_size, lk, rank_k, (h + dim_v)))
 
-    q_segment_ids = jnp.ones(shape=(batch_size, lq), dtype=int)
-    kv_segment_ids = jnp.ones(shape=(batch_size, lk), dtype=int)
+    q_segment_ids = einops.repeat(jnp.arange(lq) // 42, "l -> b l", b=batch_size)
+    kv_segment_ids = einops.repeat(jnp.arange(lk) // 42, "l -> b l", b=batch_size)
 
     do = jax.random.normal(keys[4], shape=(batch_size, lq, h, dim_v))
 
