@@ -55,7 +55,6 @@ def reference(
     where_none = jnp.isnan(p).all(axis=-1)
     p = p.at[where_none].set(0)
 
-    # TODO: use jnp.nansum in grad instead
     o = einops.einsum(p, v_, "b h lq lk, b lk h dv -> b lq h dv")
 
     where_none = einops.rearrange(where_none, "b h lq -> b lq h")
@@ -193,7 +192,7 @@ def test_tpa_backwards(
                 debug=False,
                 interpret=True,
             )
-        return einops.einsum(do, o, "b lq h dk, b lq h dk -> ")
+        return jnp.nansum(do * o)
 
     dq_, dk_, dv_ = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v, impl="ref")
     dq, dk, dv = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v, impl="kernel")
