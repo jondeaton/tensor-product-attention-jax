@@ -274,7 +274,7 @@ def _fwd_kernel(
         # TODO: these two operaitons can probably be combined into one.
         l: Float[Array, "h lq"] = _lse_accum(l_prev, _lse(x))
 
-        log_p = x - l[..., None]
+        log_p: Float[Array, "h lq lk"] = x - l[..., None]
         p = jnp.exp(log_p)
         p = jnp.where(jnp.isneginf(l[..., None]), 0.0, p)  # no data yet -> zero.
 
@@ -290,7 +290,8 @@ def _fwd_kernel(
         # pva = einops.einsum(p, va, "h lq lk, lk rk h -> h lq lk rk")
         # o_ = einops.einsum(pva, vb, "h lq lk rk, lk rk dv -> h lq dv")
 
-        o = jnp.exp(l_prev - l)[..., None] * o + o_
+        correction = jnp.exp(l_prev - l)
+        o = correction[..., None] * o + o_
 
         return o, l
 
@@ -489,7 +490,7 @@ def _bwd_kernel(
 
         l = einops.rearrange(l, "lq h -> h lq 1")
         p: Float[Array, "h lq lk"] = jnp.exp(x - l)
-        p = jnp.where(jnp.isneginf(l), 0, p)
+        p = jnp.where(jnp.isnan(p), 0, p)
 
         dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")  # TODO: avoid mat?
         dva += einops.einsum(dv, vb, "lk h dv, lk rk dv -> lk rk h") / rank_k
@@ -667,7 +668,7 @@ def _precompute_delta(
     def kernel(out_ref, dout_ref, delta_ref):
         o = out_ref[...].astype(jnp.float32)
         do = dout_ref[...].astype(jnp.float32)
-        delta = jnp.sum(o * do, axis=1)
+        delta = jnp.nansum(o * do, axis=1)
         delta_ref[...] = delta.astype(delta_ref.dtype)
 
     return pl.pallas_call(

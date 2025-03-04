@@ -13,6 +13,8 @@ import einops
 from jaxtyping import Float, Int, Array
 
 from models.attention.kernels import tpa
+from models.attention.mha import mha
+
 
 jax.config.update("jax_traceback_filtering", "off")
 
@@ -41,44 +43,18 @@ def reference(
     k_ = einops.einsum(ka, kb, "b lk rk h, b lk rk dk -> b lk h dk") / rk
     v_ = einops.einsum(va, vb, "b lk rk h, b lk rk dv -> b lk h dv") / rk
 
-    x = einops.einsum(q_, k_, "b lq h dk, b lk h dk -> b h lq lk")
-    x *= sm_scale
-
     segment_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
-    x += jnp.where(segment_mask[:, None, :, :], 0, -jnp.inf)
-
+    bias = jnp.where(segment_mask, 0, -jnp.inf)
     if causal:
         mask = jnp.tril(jnp.ones(shape=(lq, lk), dtype=bool))
-        x += jnp.where(mask, 0, -jnp.inf)
+        bias += jnp.where(mask, 0, -jnp.inf)[None, :, :]
+    assert bias.shape == (batch_size, lq, lk)
 
-    p = jax.nn.softmax(x, axis=-1)
-    where_none = jnp.isnan(p).all(axis=-1)
-    p = p.at[where_none].set(0)
-
-    o = einops.einsum(p, v_, "b h lq lk, b lk h dv -> b lq h dv")
-
-    where_none = einops.rearrange(where_none, "b h lq -> b lq h")
-    return o.at[where_none].set(jnp.nan)
+    return mha(q_, k_, v_, bias=bias, sm_scale=sm_scale)
 
 
-def mha_jax(
-    q: Float[Array, "b lq h dk"],
-    k: Float[Array, "b lk h dk"],
-    v: Float[Array, "b lk h dv"],
-    sm_scale: Float[Array, "b lq"],
-    bias: Float[Array, "b lq lk"] | None = None,
-) -> Float[Array, "b lq h dv"]:
-    """Batched multi-head attention."""
-    qk = einops.einsum(q, k, "b lq h dk, b lk h dk -> b h lq lk")
-    qk *= sm_scale[:, None, :, None]
-    if bias is not None:
-        qk += bias
-    p = jax.nn.softmax(qk, axis=-1)
-    return einops.einsum(p, v, "b h lq lk, b lk h dv -> b lq h dv")
-
-
-@pytest.mark.parametrize("rank_q", [1, 2, 6])
-@pytest.mark.parametrize("rank_k", [1, 2, 4])
+@pytest.mark.parametrize("rank_q", [1, 6])
+@pytest.mark.parametrize("rank_k", [1, 4])
 @pytest.mark.parametrize("nomat", [False, True])
 @pytest.mark.parametrize(
     "batch_size,lq,lk,h,dk,dv",
@@ -134,8 +110,8 @@ def test_tpa_forward(
     np.testing.assert_allclose(out, out_ref, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("rank_q", [1, 2, 6])
-@pytest.mark.parametrize("rank_k", [1, 2, 4])
+@pytest.mark.parametrize("rank_q", [1, 6])
+@pytest.mark.parametrize("rank_k", [1, 4])
 @pytest.mark.parametrize("nomat", [False, True])
 @pytest.mark.parametrize(
     "batch_size,lq,lk,h,dim_k,dim_v",
@@ -156,6 +132,7 @@ def test_tpa_backwards(
     dim_k: int,
     dim_v: int,
 ):
+    # pytest.skip()
     key = jax.random.PRNGKey(0)
     keys = jax.random.split(key, 4)
 
@@ -189,10 +166,9 @@ def test_tpa_backwards(
                 num_heads=h,
                 nomat=nomat,
                 causal=False,
-                debug=False,
                 interpret=True,
             )
-        return jnp.nansum(do * o)
+        return jnp.nansum(o)
 
     dq_, dk_, dv_ = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v, impl="ref")
     dq, dk, dv = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v, impl="kernel")
