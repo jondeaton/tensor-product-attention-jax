@@ -25,8 +25,8 @@ class BlockSizes:
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
 def tpa(
-    q: Float[Array, "b lq rq (h + dh)"],
-    k: Float[Array, "b lk rk (h + dh)"],
+    q: Float[Array, "b lq rq (h + dk)"],
+    k: Float[Array, "b lk rk (h + dk)"],
     v: Float[Array, "b lk rk (h + dv)"],
     q_segment_ids: Int[Array, "b lq"],
     kv_segment_ids: Int[Array, "b lk"],
@@ -162,13 +162,14 @@ def _lse(x: jax.Array):
     return jnp.where(jnp.isneginf(m), -jnp.inf, l_)
 
 
-def _lse_combine(a: jax.Array, b: jax.Array) -> jax.Array:
-    """Combine LSE.
-    a > b
+def _lse_accum(a: jax.Array, b: jax.Array) -> jax.Array:
+    """Accumulat log-sum-exp.
+
+    let a > b
     log(exp(a) + exp(b))
-    = a + log(exp(a - a) + exp(b - a))
-    = a + log(1 + exp(b - a))
-    = a + softplus(b - a)
+        = a + log(exp(a - a) + exp(b - a))
+        = a + log(1 + exp(b - a))
+        = a + softplus(b - a)
     """
     assert a.shape == b.shape, f"mismatching shapes: {a.shape}, {b.shape}"
     max = jnp.maximum(a, b)
@@ -271,7 +272,7 @@ def _fwd_kernel(
         x = jnp.where(mask[None, ...], x, -jnp.inf)
 
         # TODO: these two operaitons can probably be combined into one.
-        l: Float[Array, "h lq"] = _lse_combine(l_prev, _lse(x))
+        l: Float[Array, "h lq"] = _lse_accum(l_prev, _lse(x))
 
         log_p = x - l[..., None]
         p = jnp.exp(log_p)
