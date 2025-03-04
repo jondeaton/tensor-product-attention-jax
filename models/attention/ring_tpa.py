@@ -141,8 +141,7 @@ def _ring_tpa_bwd(
     rotate = functools.partial(_rotate_block, axis_name=axis_name, axis_size=axis_size)
 
     def scan_fn(carry, _):
-        q, o, dq, dk, dv, do, l, q_segment_ids = carry
-
+        dq, dk, dv, k, v, kv_segment_ids = carry
         dq_, dk_, dv_ = bwd_block_fn(
             q,
             k,
@@ -157,16 +156,17 @@ def _ring_tpa_bwd(
         dk += dk_
         dv += dv_
 
-        q, o, dq, do, l, q_segment_ids = rotate([q, o, dq, do, l, q_segment_ids])
-        return (q, o, dq, dk, dv, do, l, q_segment_ids), None
+        dk, dv, k, v, kv_segment_ids = rotate([dk, dv, k, v, kv_segment_ids])
+        carry = dq, dk, dv, k, v, kv_segment_ids
+        return carry, None
 
     dq = jnp.zeros_like(q)
     dk = jnp.zeros_like(k)
     dv = jnp.zeros_like(v)
 
-    (q, o, dq, dk, dv, do, _, q_segment_ids), _ = jax.lax.scan(
+    (dq, dk, dv, _, _, _), _ = jax.lax.scan(
         scan_fn,
-        init=(q, o, dq, dk, dv, do, l, q_segment_ids),
+        init=(dq, dk, dv, k, v, kv_segment_ids),
         xs=jnp.arange(axis_size),
     )
     return dq, dk, dv, None, None
