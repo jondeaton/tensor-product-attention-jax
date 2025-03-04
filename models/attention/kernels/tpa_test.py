@@ -60,8 +60,9 @@ def reference(
     "batch_size,lq,lk,h,dk,dv",
     [
         (1, 8, 8, 1, 4, 6),
-        (2, 1024, 128, 4, 32, 8),
-        (2, 128, 1024, 4, 32, 8),
+        (2, 1024, 128, 2, 3, 5),
+        (2, 128, 1024, 2, 3, 5),
+        (1, 1024, 1024, 2, 3, 5),
     ],
 )
 def test_tpa_forward(
@@ -117,8 +118,9 @@ def test_tpa_forward(
     "batch_size,lq,lk,h,dim_k,dim_v",
     [
         (1, 8, 8, 1, 4, 6),
-        (2, 1024, 128, 4, 32, 8),
-        (2, 128, 1024, 4, 32, 8),
+        (2, 1024, 128, 2, 3, 5),
+        (2, 128, 1024, 2, 3, 5),
+        (1, 1024, 1024, 2, 3, 5),
     ],
 )
 def test_tpa_backwards(
@@ -132,7 +134,6 @@ def test_tpa_backwards(
     dim_k: int,
     dim_v: int,
 ):
-    # pytest.skip()
     key = jax.random.PRNGKey(0)
     keys = jax.random.split(key, 4)
 
@@ -142,8 +143,6 @@ def test_tpa_backwards(
 
     q_segment_ids = einops.repeat(jnp.arange(lq) // 42, "l -> b l", b=batch_size)
     kv_segment_ids = einops.repeat(jnp.arange(lk) // 42, "l -> b l", b=batch_size)
-
-    do = jax.random.normal(keys[4], shape=(batch_size, lq, h, dim_v))
 
     def _ref(q, k, v, impl: str) -> Float[Array, ""]:
         if impl == "ref":

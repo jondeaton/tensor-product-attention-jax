@@ -291,8 +291,8 @@ def _fwd_kernel(
         # o_ = einops.einsum(pva, vb, "h lq lk rk, lk rk dv -> h lq dv")
 
         correction = jnp.exp(l_prev - l)
+        correction = jnp.where(jnp.isneginf(l), 0, correction)
         o = correction[..., None] * o + o_
-
         return o, l
 
     if causal:
@@ -305,7 +305,11 @@ def _fwd_kernel(
     l = jnp.zeros(shape=(block_h, block_q), dtype=jnp.float32) - jnp.inf
     o, l = jax.lax.fori_loop(0, num_kv_blocks, _scan_fn, (o, l))
 
-    # store final output
+    # TODO: consider defining empty attention to be zero instead of nan to avoid this
+    # explicit case handling if this is slow.
+    o = jnp.where(jnp.isneginf(l)[..., None], jnp.nan, o)
+
+    # Store final output.
     o_ref[...] = einops.rearrange(o, "h l d -> l h d")
     l_ref[...] = einops.rearrange(l, "h l -> l h")
 

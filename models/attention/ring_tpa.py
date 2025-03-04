@@ -83,11 +83,15 @@ def _ring_tpa_fwd(
 
         # accumulator corrections, accounting for blocks with no data.
         o *= jnp.exp(l - l_next)[..., None]
+        o = jnp.nan_to_num(o, nan=0)
+
         o_ *= jnp.exp(l_ - l_next)[..., None]
+        o_ = jnp.nan_to_num(o_, nan=0)
+
         o += o_
 
-        no_data = jnp.isneginf(l_next)
-        o = jnp.where(no_data[..., None], 0, o)
+        # no_data = jnp.isneginf(l_next)
+        # o = jnp.where(no_data[..., None], 0, o)
 
         k, v, kv_segment_ids = rotate([k, v, kv_segment_ids])
         return (o, l_next, k, v, kv_segment_ids), None
@@ -101,7 +105,8 @@ def _ring_tpa_fwd(
         xs=jnp.arange(axis_size),
     )
 
-    o = jnp.where(jnp.isneginf(l)[..., None], jnp.nan, o)
+    # Empty attention has value nan.
+    o = jnp.where(jnp.isneginf(l[..., None]), jnp.nan, o)
 
     residuals = q, k, v, o, l, q_segment_ids, kv_segment_ids
     return o, residuals
