@@ -303,26 +303,18 @@ def _fwd_kernel(
 
         if nomat:
 
-            def _accumulate_output(
-                o: Float[Array, "h lq dv"],
-                vavb: tuple[
-                    Float[Array, "lk h"],
-                    Float[Array, "lk dv"],
-                ],
-            ) -> tuple[Float[Array, "h lq dv"], None]:
-                va, vb = vavb
-                pva = einops.einsum(p, va, "h lq lk, lk h -> h lq lk")
-                o_ = einops.einsum(pva, vb, "h lq lk , lk dv -> h lq dv")
+            def accum_out(
+                o: Float[Array, "h lq dv"], i: Int
+            ) -> Float[Array, "h lq dv"]:
+                pva = einops.einsum(p, va[:, i], "h lq lk, lk h -> h lq lk")
+                o_ = einops.einsum(pva, vb[:, i], "h lq lk , lk dv -> h lq dv")
                 o += o_ / rank_k
-                return o, None
+                return o
 
-            o_, _ = jax.lax.scan(
-                _accumulate_output,
+            o_, _ = jax.lax.scan(  # over rank_k
+                lambda o, i: (accum_out(o, i), None),
                 init=jnp.zeros(shape=(block_h, block_q, dv), dtype=va.dtype),
-                xs=(
-                    einops.rearrange(va, "lk rk h -> rk lk h"),
-                    einops.rearrange(vb, "lk rk dv -> rk lk dv"),
-                ),
+                xs=jnp.arange(rank_k),
             )
 
         else:
