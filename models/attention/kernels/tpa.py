@@ -250,9 +250,29 @@ def _fwd_kernel(
             # NOTE: this strategy uses more SRAM per block but reduces the amount of
             # flops by sharding query/key inner products amongst heads.
             bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-            x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
-            x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
-            # x = einops.einsum(qa, ka, bb, "lq rq h, lk rk h, lq lk rk -> h lq lk")
+
+            # NOTE: the following double scan is equivalent to the following reduciton
+            # but uses less memory sinc jax.lax.scan without unrolling is guaranteed
+            # to reuse input/output buffers. Prior implementation:
+            # x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
+            # x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+
+            def accum_logits(out, i: Int, j: Int) -> Float[Array, "h lq lk"]:
+                return out + einops.einsum(
+                    qa[:, i], ka[:, j], bb[:, :, i, j], "lq h, lk h, lq lk -> h lq lk"
+                )
+
+            x, _ = jax.lax.scan(  # over rank_q
+                lambda o, i: jax.lax.scan(  # over rank_k
+                    lambda o, j: (accum_logits(o, i, j), None),
+                    init=o,
+                    xs=jnp.arange(rank_k),
+                ),
+                init=jnp.zeros(shape=(block_h, block_q, block_kv), dtype=ka.dtype),
+                xs=jnp.arange(rank_q),
+            )
+            x /= rank_q * rank_k
+
         else:
             # NOTE: this strategy materializes q and k in the highest memory cache
             # but still avoids materializing them in HBM.
@@ -478,8 +498,12 @@ def _bwd_kernel(
     kv_segment_ids = kv_segment_ids_ref[...]
 
     # TODO: avoid materializing in the nomat case...?
-    k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
-    v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
+    if not nomat:
+        k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
+        v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
+    else:
+        raise NotImplementedError("Non QKV-materializing backward kernel.")
+        k, v = None, None
 
     def _fn(start_q: int, carry):
         dka, dkb, dva, dvb = carry
@@ -492,15 +516,16 @@ def _bwd_kernel(
 
         q = einops.einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
 
-        # TODOO: handle nomat case
-        # if nomat:
-        #     bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-        #     x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
-        #     x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
-        x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
+        if nomat:
+            assert q is None and k is None
+            bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
+            x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
+            x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+        else:
+            assert q is not None and k is not None
+            x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
 
         assert x is not None
-
         x *= sm_scale
 
         mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
@@ -519,23 +544,90 @@ def _bwd_kernel(
         p: Float[Array, "h lq lk"] = jnp.exp(x - l)
         p = jnp.where(jnp.isnan(p), 0, p)
 
-        dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")  # TODO: avoid mat?
-        dva += einops.einsum(dv, vb, "lk h dv, lk rk dv -> lk rk h") / rank_k
-        dvb += einops.einsum(dv, va, "lk h dv, lk rk h -> lk rk dv") / rank_k
+        if nomat:
 
-        dp = einops.repeat(-di, "lq h -> h lq lk", lk=k_len)
-        dp += einops.einsum(do, v, "lq h dv, lk h dv -> h lq lk")
+            def accumulate_dp(dp_dv, vavb):
+                dp, dva, dvb = dp_dv
+                va, vb = vavb
 
-        ds = p * dp
-        ds *= sm_scale
+                dovb = einops.einsum(do, vb, "lq h dv, lk dv -> h lq lk")
+                pva = einops.einsum(p, va, "h lq lk, lk h -> lq lk")  # TODO: correct?
 
-        dk = einops.einsum(ds, q, "h lq lk, lq h dk -> lk h dk")
-        dka = einops.einsum(dk, kb, "lk h dk, lk rk dk -> lk rk h") / rank_k
-        dkb = einops.einsum(dk, ka, "lk h dk, lk rk h -> lk rk dk") / rank_k
+                dva += einops.einsum(dovb, p, "h lq lk, h lq lk -> h lk")
+                dvb += einops.einsum(pva, vb, "lq lk, lk dv -> lq dv")  # TODO: correct?
 
-        dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
-        dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
-        dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
+                dp += einops.einsum(dovb, va, "h lq lk, lk h -> h lq lk")
+
+                return (dp, dva, dvb), None
+
+            (dp, dva, dvb), _ = jax.lax.scan(
+                accumulate_dp,
+                init=(
+                    einops.repeat(-di, "lq h -> h lq lk", lk=k_len),  # dp
+                    jnp.zeros_like(va),  # dva
+                    jnp.zeros_like(vb),  # dvb
+                ),
+                xs=(
+                    # gotta rearrange them to have leading axes
+                    einops.rearrange(va, "lk rk h -> rk lk h"),
+                    einops.rearrange(vb, "lk rk dv -> rk lk dv"),
+                ),
+            )
+            ds = p * dp * sm_scale
+
+            pqa = einops.einsum(p, qa, "h lq lk, lq rq h -> lq lk rq")
+            pka = einops.einsum(q, ka, "h lq lk, lk rk h -> lq lk rk")
+
+            qbkb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
+            qaka = einops.einsum(qa, ka, "lq rq h, lk rk, h -> lq lk rq rk")
+
+            def accumulate_dk(dka_dkb, ka_kb):
+                dka, dkb = dka_dkb
+                ka, kb, qbkb_ = ka_kb
+
+                dka += einops.einsum(pqa, qbkb_, "lq lk rq, lq lk rq -> lk h")
+
+                # TODO: ... really not sure about this one ...
+                pqaqb = einops.einsum(pqa, ka, "lq lk rq, lk h -> lq lk rq")
+                dkb += einops.einsum(pqaqb, qb, "lq lk rq, lq rq dk -> lk dk")
+
+            dka, dkb = jax.lax.scan(
+                accumulate_dk,
+                init=(
+                    jnp.zeros_like(ka),
+                    jnp.zeros_like(kb),
+                ),
+                xs=(
+                    einops.rearrange(ka, "lk rk h -> rk lk h"),
+                    einops.rearrange(kb, "lk rk dk -> rk lk dk"),
+                ),
+            )
+
+            def accumulate_dq(): ...
+
+            dqa, dqb = jax.lax.scan(accumulate_dq, ...)
+
+        else:
+            assert v is not None
+            dv = einops.einsum(p, do, "h lq lk, lq h dv -> lk h dv")
+            dva += einops.einsum(dv, vb, "lk h dv, lk rk dv -> lk rk h") / rank_k
+            dvb += einops.einsum(dv, va, "lk h dv, lk rk h -> lk rk dv") / rank_k
+
+            dp = einops.repeat(-di, "lq h -> h lq lk", lk=k_len)
+            dp += einops.einsum(do, v, "lq h dv, lk h dv -> h lq lk")
+
+            ds = p * dp
+            ds *= sm_scale
+
+            assert q is not None
+            dk = einops.einsum(ds, q, "h lq lk, lq h dk -> lk h dk")
+            dka = einops.einsum(dk, kb, "lk h dk, lk rk dk -> lk rk h") / rank_k
+            dkb = einops.einsum(dk, ka, "lk h dk, lk rk h -> lk rk dk") / rank_k
+
+            assert k is not None
+            dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
+            dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
+            dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
 
         pl.atomic_add(dqa_ref, (q_slice, slice(None), slice(None)), dqa)
         pl.atomic_add(dqb_ref, (q_slice, slice(None), slice(None)), dqb)
