@@ -281,14 +281,36 @@ def _fwd_kernel(
         va = va_ref[kv_slice, slice(None), slice(None)]
         vb = vb_ref[kv_slice, slice(None), slice(None)]
 
-        # TODO: maybe its fine to materialize v in the kernel?
-        v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
-        o_ = einops.einsum(p, v, "h lq lk, lk h dv -> h lq dv")
-        assert o_.shape == (block_h, block_q, dv), o_.shape
+        if nomat:
 
-        # idk if this can fit into smem
-        # pva = einops.einsum(p, va, "h lq lk, lk rk h -> h lq lk rk")
-        # o_ = einops.einsum(pva, vb, "h lq lk rk, lk rk dv -> h lq dv")
+            def _accumulate_output(
+                o: Float[Array, "h lq dv"],
+                vavb: tuple[
+                    Float[Array, "lk h"],
+                    Float[Array, "lk dv"],
+                ],
+            ) -> tuple[Float[Array, "h lq dv"], None]:
+                va, vb = vavb
+                pva = einops.einsum(p, va, "h lq lk, lk h -> h lq lk")
+                o_ = einops.einsum(pva, vb, "h lq lk , lk dv -> h lq dv")
+                o += o_ / rank_k
+                return o, None
+
+            o_, _ = jax.lax.scan(
+                _accumulate_output,
+                init=jnp.zeros(shape=(block_h, block_q, dv), dtype=va.dtype),
+                xs=(
+                    einops.rearrange(va, "lk rk h -> rk lk h"),
+                    einops.rearrange(vb, "lk rk dv -> rk lk dv"),
+                ),
+            )
+
+        else:
+            # simple case just materialize V
+            v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
+            o_ = einops.einsum(p, v, "h lq lk, lk h dv -> h lq dv")
+
+        assert o_.shape == (block_h, block_q, dv), o_.shape
 
         correction = jnp.exp(l_prev - l)
         correction = jnp.where(jnp.isneginf(l), 0, correction)
@@ -342,7 +364,7 @@ def _fwd(
            query/key inner products across ranks.
     """
     q_len, rank_q, h_dk = q.shape
-    k_len, rank_k, h_dv = v.shape
+    k_len, rank_k, _ = v.shape
     assert k.shape == (k_len, rank_k, h_dk), k.shape
 
     qa, qb = q[:, :, :num_heads], q[:, :, num_heads:]
@@ -438,6 +460,7 @@ def _bwd_kernel(
     k_len, rank_k, dim_k = kb_ref.shape
     block_q, block_h, dim_v = o_ref.shape
 
+    # grid is (heads, kv block)
     start_k = pl.program_id(1)
 
     dka = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=jnp.float32)
