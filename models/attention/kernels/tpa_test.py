@@ -23,8 +23,8 @@ def reference(
     q: Float[Array, "b lq rq (h + dh)"],
     k: Float[Array, "b lk rk (h + dh)"],
     v: Float[Array, "b lk rk (h + dv)"],
-    q_segment_ids: Int[Array, "b lq"],
-    kv_segment_ids: Int[Array, "b lk"],
+    q_segment_ids: Int[Array, "b lq"] | None,
+    kv_segment_ids: Int[Array, "b lk"] | None,
     num_heads: int,
     sm_scale: float = 1.0,
     causal: bool = False,
@@ -43,8 +43,12 @@ def reference(
     k_ = einops.einsum(ka, kb, "b lk rk h, b lk rk dk -> b lk h dk") / rk
     v_ = einops.einsum(va, vb, "b lk rk h, b lk rk dv -> b lk h dv") / rk
 
-    segment_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
-    bias = jnp.where(segment_mask, 0, -jnp.inf)
+    bias = jnp.zeros(shape=(batch_size, lq, lk))
+    if q_segment_ids is not None:
+        assert kv_segment_ids is not None
+        segment_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
+        bias += jnp.where(segment_mask, 0, -jnp.inf)
+
     if causal:
         mask = jnp.tril(jnp.ones(shape=(lq, lk), dtype=bool))
         bias += jnp.where(mask, 0, -jnp.inf)[None, :, :]
@@ -94,8 +98,8 @@ def test_tpa_forward(
             jnp.arange(lk) // segment_size, "l -> b l", b=batch_size
         )
     else:
-        q_segment_ids = jnp.zeros(shape=(batch_size, lq), dtype=int)
-        kv_segment_ids = jnp.zeros(shape=(batch_size, lk), dtype=int)
+        q_segment_ids, kv_segment_ids = None, None
+
     out_ref = reference(
         q,
         k,
@@ -110,9 +114,9 @@ def test_tpa_forward(
         q,
         k,
         v,
+        num_heads=h,
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
-        num_heads=h,
         nomat=nomat,
         debug=False,
         interpret=True,
@@ -162,8 +166,7 @@ def test_tpa_backwards(
             jnp.arange(lk) // segment_size, "l -> b l", b=batch_size
         )
     else:
-        q_segment_ids = jnp.zeros(shape=(batch_size, lq), dtype=int)
-        kv_segment_ids = jnp.zeros(shape=(batch_size, lk), dtype=int)
+        q_segment_ids, kv_segment_ids = None, None
 
     def _ref(q, k, v, impl: str) -> Float[Array, ""]:
         if impl == "ref":

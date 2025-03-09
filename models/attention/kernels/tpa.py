@@ -1,4 +1,4 @@
-"""Tensor Product Attention Pallas Kernels."""
+"""Tensor Product Attention: Flash Pallas Kernels."""
 
 from __future__ import annotations
 
@@ -52,14 +52,14 @@ class BlockSizes:
     block_h: int = 4
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 6, 7, 8, 9, 10, 11))
 def tpa(
     q: Float[Array, "b lq rq (h + dk)"],
     k: Float[Array, "b lk rk (h + dk)"],
     v: Float[Array, "b lk rk (h + dv)"],
-    q_segment_ids: Int[Array, "b lq"],
-    kv_segment_ids: Int[Array, "b lk"],
     num_heads: int,
+    q_segment_ids: Int[Array, "b lq"] | None = None,
+    kv_segment_ids: Int[Array, "b lk"] | None = None,
     sm_scale: float = 1.0,
     causal: bool = False,
     block_sizes: BlockSizes | None = None,
@@ -90,9 +90,9 @@ def tpa(
         q,
         k,
         v,
+        num_heads=num_heads,
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
-        num_heads=num_heads,
         sm_scale=sm_scale,
         causal=causal,
         block_sizes=block_sizes,
@@ -107,9 +107,9 @@ def _tpa_fwd(
     q: Float[Array, "b lq rq (h + dk)"],
     k: Float[Array, "b lk rk (h + dk)"],
     v: Float[Array, "b lk rk (h + dv)"],
-    q_segment_ids: Int[Array, "b lq"],
-    kv_segment_ids: Int[Array, "b lk"],
     num_heads: int,
+    q_segment_ids: Int[Array, "b lq"] | None,
+    kv_segment_ids: Int[Array, "b lk"] | None,
     sm_scale: Float,
     causal: bool,
     block_sizes: BlockSizes | None,
@@ -134,7 +134,13 @@ def _tpa_fwd(
             debug=debug,
             interpret=interpret,
         ),
-        in_axes=[0, 0, 0, 0, 0],
+        in_axes=[
+            0,
+            0,
+            0,
+            0 if q_segment_ids is not None else None,
+            0 if kv_segment_ids is not None else None,
+        ],
         out_axes=0,
     )(q, k, v, q_segment_ids, kv_segment_ids)
     res = q, k, v, q_segment_ids, kv_segment_ids, o, l
@@ -175,7 +181,16 @@ def _tpa_bwd(
             debug=debug,
             interpret=interpret,
         ),
-        in_axes=[0, 0, 0, 0, 0, 0, 0, 0],
+        in_axes=[
+            0,
+            0,
+            0,
+            0 if q_segment_ids is not None else None,
+            0 if kv_segment_ids is not None else None,
+            0,
+            0,
+            0,
+        ],
         out_axes=0,
     )(q, k, v, q_segment_ids, kv_segment_ids, o, l, do)
     return dq, dk, dv, None, None
@@ -214,8 +229,8 @@ def _fwd_kernel(
     kb_ref: Float[Array, "lk rk dk"],
     va_ref: Float[Array, "lk rk h"],
     vb_ref: Float[Array, "lk rk dv"],
-    q_segment_ids_ref: Int[Array, " lq"],
-    kv_segment_ids_ref: Int[Array, " lk"],
+    q_segment_ids_ref: Int[Array, " lq"] | None,
+    kv_segment_ids_ref: Int[Array, " lk"] | None,
     o_ref: Float[Array, "lq h dv"],
     l_ref: Float[Array, "lq h"],
     sm_scale: float,
@@ -258,7 +273,7 @@ def _fwd_kernel(
     start_q = pl.program_id(1)
     qa = qa_ref[...]
     qb = qb_ref[...]
-    q_segment_ids = q_segment_ids_ref[...]
+    q_segment_ids = q_segment_ids_ref[...] if q_segment_ids_ref is not None else None
 
     if not nomat:
         q = einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
@@ -313,14 +328,24 @@ def _fwd_kernel(
 
         x *= sm_scale
 
-        kv_segment_ids = kv_segment_ids_ref[kv_slice]
-        mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
+        if kv_segment_ids_ref is not None:
+            assert q_segment_ids is not None
+            kv_segment_ids = kv_segment_ids_ref[kv_slice]
+            mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
+        else:
+            mask = None
+
         if causal:
             span_q = start_q * block_q + jnp.arange(block_q)
             span_k = start_k * block_kv + jnp.arange(block_kv)
             causal_mask = span_q[:, None] >= span_k[None, :]
-            mask &= causal_mask
-        x = jnp.where(mask[None, ...], x, -jnp.inf)
+            if mask is not None:
+                mask &= causal_mask
+            else:
+                mask = causal_mask
+
+        if mask is not None:
+            x = jnp.where(mask[None, ...], x, -jnp.inf)
 
         # TODO: these two operaitons can probably be combined into one.
         l: Float[Array, "h lq"] = _lse_accum(l_prev, _lse(x))
@@ -384,8 +409,8 @@ def _fwd(
     q: Float[Array, "lq rq (h + dk)"],
     k: Float[Array, "lk rk (h + dk)"],
     v: Float[Array, "lk rk (h + dv)"],
-    q_segment_ids: Int[Array, " lq"],
-    kv_segment_ids: Int[Array, " lk"],
+    q_segment_ids: Int[Array, " lq"] | None,
+    kv_segment_ids: Int[Array, " lk"] | None,
     num_heads: int,
     sm_scale: Float,
     causal: bool,
@@ -445,8 +470,16 @@ def _fwd(
             pl.BlockSpec((k_len, rank_k, dim_k), lambda *_: (0, 0, 0)),  # kb
             pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # va
             pl.BlockSpec((k_len, rank_k, dim_v), lambda *_: (0, 0, 0)),  # vb
-            pl.BlockSpec((block_q,), lambda _, lq: (lq,)),  # q_segment_ids
-            pl.BlockSpec((k_len,), lambda *_: (0,)),  # kv_segment_ids
+            (
+                pl.BlockSpec((block_q,), lambda _, lq: (lq,))  # q_segment_ids
+                if q_segment_ids is not None
+                else None
+            ),
+            (
+                pl.BlockSpec((k_len,), lambda *_: (0,))  # kv_segment_ids
+                if kv_segment_ids is not None
+                else None
+            ),
         ],
         out_specs=[
             pl.BlockSpec((block_q, block_h, dim_v), lambda h, lq: (lq, h, 0)),  # out
@@ -457,6 +490,8 @@ def _fwd(
             jax.ShapeDtypeStruct(shape=(q_len, num_heads), dtype=jnp.float32),  # lse
         ],
         compiler_params=dict(
+            # TODO: tune these compiler params?
+            # TODO: should be TPU params?
             triton=dict(
                 num_warps=4 if dim_k <= 64 else 8,
                 num_stages=2,
@@ -475,8 +510,8 @@ def _bwd_kernel(
     kb_ref: Float[Array, "lk rk dk"],
     va_ref: Float[Array, "lk rk h"],
     vb_ref: Float[Array, "lk rk dv"],
-    q_segment_ids_ref: Int[Array, " lq"],
-    kv_segment_ids_ref: Int[Array, " lk"],
+    q_segment_ids_ref: Int[Array, " lq"] | None,
+    kv_segment_ids_ref: Int[Array, " lk"] | None,
     o_ref: Float[Array, "lq h dv"],
     l_ref: Float[Array, "lq h"],
     do_ref: Float[Array, "lq h dv"],
@@ -519,7 +554,7 @@ def _bwd_kernel(
     va = va_ref[...]
     vb = vb_ref[...]
 
-    kv_segment_ids = kv_segment_ids_ref[...]
+    kv_segment_ids = kv_segment_ids_ref[...] if kv_segment_ids_ref is not None else None
 
     if not nomat:
         v = einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
@@ -536,7 +571,11 @@ def _bwd_kernel(
 
         qa = qa_ref[q_slice, ...]
         qb = qb_ref[q_slice, ...]
-        q_segment_ids = q_segment_ids_ref[q_slice]
+
+        if q_segment_ids_ref is not None:
+            q_segment_ids = q_segment_ids_ref[q_slice]
+        else:
+            q_segment_ids = None
 
         q = einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
 
@@ -572,13 +611,21 @@ def _bwd_kernel(
         assert x is not None
         x *= sm_scale
 
-        mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
+        if q_segment_ids is not None:
+            mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
+        else:
+            mask = None
+
         if causal:
             span_q = start_q * block_q + jnp.arange(block_q)
             span_k = start_k * block_kv + jnp.arange(block_kv)
             causal_mask = span_q[:, None] >= span_k[None, :]
-            mask &= causal_mask
-        x = jnp.where(mask[None, ...], x, -jnp.inf)
+            if mask is not None:
+                mask &= causal_mask
+            else:
+                mask = causal_mask
+        if mask is not None:
+            x = jnp.where(mask[None, ...], x, -jnp.inf)
 
         l = l_ref[q_slice, ...]
         do = do_ref[q_slice, ...]
@@ -737,8 +784,8 @@ def _bwd(
     q: Float[Array, "lq rq (h + dk)"],
     k: Float[Array, "lk rk (h + dk)"],
     v: Float[Array, "lk rk (h + dv)"],
-    q_segment_ids: Int[Array, " lq"],
-    kv_segment_ids: Int[Array, " lk"],
+    q_segment_ids: Int[Array, " lq"] | None,
+    kv_segment_ids: Int[Array, " lk"] | None,
     o: Float[Array, "lq h dv"],
     l: Float[Array, "lq h"],
     do: Float[Array, "lq h dv"],
@@ -814,8 +861,16 @@ def _bwd(
             pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # va
             pl.BlockSpec((block_kv, rank_k, dim_v), lambda _, lk: (lk, 0, 0)),  # vb
             # control
-            pl.BlockSpec((q_len,), lambda _, lk: (0,)),  # q_segment_ids
-            pl.BlockSpec((block_kv,), lambda _, lk: (lk,)),  # kv_segment_ids
+            (
+                pl.BlockSpec((q_len,), lambda _, lk: (0,))  # q_segment_ids
+                if q_segment_ids is not None
+                else None
+            ),
+            (
+                pl.BlockSpec((block_kv,), lambda _, lk: (lk,))  # kv_segment_ids
+                if kv_segment_ids is not None
+                else None
+            ),
             # outputs
             pl.BlockSpec((q_len, block_h, dim_v), lambda h, lk: (0, h, 0)),  # o
             pl.BlockSpec((q_len, block_h), lambda h, lk: (0, h)),  # l
@@ -841,7 +896,10 @@ def _bwd(
             jax.ShapeDtypeStruct(shape=va.shape, dtype=va.dtype),
             jax.ShapeDtypeStruct(shape=vb.shape, dtype=vb.dtype),
         ],
-        input_output_aliases={12: 0, 13: 1},  # dqa, dqb
+        input_output_aliases={
+            12 if q_segment_ids is not None else 10: 0,  # dqa
+            13 if q_segment_ids is not None else 11: 1,  # dqb
+        },
         compiler_params=dict(
             triton=dict(  # TODO: need to adjust this???
                 num_warps=4 if dim_k <= 64 else 8,
