@@ -38,7 +38,7 @@ def reference(
     batch_size, lq, rq, _ = qa.shape
     _, lk, rk, _ = ka.shape
 
-    # easiest implementation is fully materialize q,k,v by tensor product.
+    # easiest implementation: fully materialize q,k,v by tensor product.
     q_ = einops.einsum(qa, qb, "b lq rq h, b lq rq dk -> b lq h dk") / rq
     k_ = einops.einsum(ka, kb, "b lk rk h, b lk rk dk -> b lk h dk") / rk
     v_ = einops.einsum(va, vb, "b lk rk h, b lk rk dv -> b lk h dv") / rk

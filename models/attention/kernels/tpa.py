@@ -620,13 +620,50 @@ def _bwd_kernel(
             ds = p * dp * sm_scale
 
             # TODO: this part is hard...
+
+            def accumulate_dq(
+                dqa_dqb,
+                i: Int,
+                j: Int,
+            ):
+                """
+                # dq = ds dk
+                # dqa = ds (ka kb) qb = (ds ka) (kb qb)
+                # dqb = ds (ka kb) qa = (ds qa ka) kb
+
+                dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
+                dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
+                dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
+                """
+                dqa, dqb = dqa_dqb
+                assert bb is not None
+
+                dska = einsum(ds, ka[:, j], "h lq lk, lk h -> h lq lk") / rank_k
+
+                dqa = dqa.at[:, i].add(
+                    einsum(dska, bb[i, j], "h lq lk, lq lk -> lq h") / rank_q
+                )
+
+                dsqaka = einsum(dska, qa[:, i], "h lq lk, lq h -> lq lk")
+                dqb = dqb.at[:, i].add(
+                    einsum(dsqaka, kb[:, j], "lq lk, lk dk -> lq dk") / rank_q
+                )
+
+                return (dqa, dqb), None
+
+            (dqa, dqb), _ = jax.lax.scan(  # over rank_q
+                lambda dqa_dqb, i: jax.lax.scan(  # over rank_k
+                    lambda dqa_dqb, j: accumulate_dq(dqa_dqb, i, j),
+                    init=dqa_dqb,
+                    xs=jnp.arange(rank_k),
+                ),
+                init=jax.tree.map(jnp.zeros_like, (qa, qb)),
+                xs=jnp.arange(rank_q),
+            )
+
             dk = einops.einsum(ds, q, "h lq lk, lq h dk -> lk h dk")
             dka += einops.einsum(dk, kb, "lk h dk, lk rk dk -> lk rk h") / rank_k
             dkb += einops.einsum(dk, ka, "lk h dk, lk rk h -> lk rk dk") / rank_k
-
-            dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
-            dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
-            dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
 
             # TODO : convert this into jax.lax.scan
             #
