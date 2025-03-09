@@ -10,16 +10,44 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 import einops
+from einops import einsum
 from jaxtyping import Int, Float, Array
 
 
 @dataclasses.dataclass
 class BlockSizes:
-    # query and key/value block length sizes.
+    """Configures sizes of input array slices for kernels."""
+
+    # Query and key/value block length sizes.
     block_q: int = 128
     block_kv: int = 128
-    # Number of attention heads processes simultaneously, and thus share computation of
-    # query/key factor inner products.
+
+    # The number of attention heads processed simultaneously in each program. This
+    # defines the number of heads which share query/key facor inner products with the
+    # "no materialize" strategy.
+    # NOTE: In order to actually benefit from reduction in FLOPs in the "nomat" case, we
+    # must share a sufficient number of heads to satisfy the following condition:
+    #
+    #     rank_q * rank_k * (num_heads * d_head) <= num_heads * d_head
+    #
+    # Estimating from default sizes: rank_q: 6, rank_k: 2, d_head: 64
+    # we have h * d / rq * rk * (d + h)
+    # h 64: 2.66
+    # h 32: 1.77
+    # h 16: 1.00
+    # h 8: 0.6
+    #
+    # So generally we need to share >=32 heads per kernel program in order to benefit.
+    # On TPUv4 architcture, we have 0.25MiB = 260k bytes of VREG.
+    #
+    # We generally need to compute slices of shape (block_h, block_q, block_kv) during
+    # the kernel process. With bfloat6, these are the proportion of VREG occupied
+    # block_h, block_q, block_kv, VREG%
+    #       8      128       128    100%
+    #      32       32        32     25%
+    #
+    # So generally we should reduce the q/kv block sizes down from the default values
+    # of 128 in order to share
     block_h: int = 4
 
 
@@ -246,6 +274,8 @@ def _fwd_kernel(
         ka = ka_ref[kv_slice, slice(None), slice(None)]
         kb = kb_ref[kv_slice, slice(None), slice(None)]
 
+        # Compute attention logits for all.
+        x: Float[Array, "h lq lk"]
         if nomat:
             # NOTE: this strategy uses more SRAM per block but reduces the amount of
             # flops by sharding query/key inner products amongst heads.
@@ -272,7 +302,7 @@ def _fwd_kernel(
                 xs=jnp.arange(rank_q),
             )
             x /= rank_q * rank_k
-
+            del bb
         else:
             # NOTE: this strategy materializes q and k in the highest memory cache
             # but still avoids materializing them in HBM.
@@ -494,7 +524,7 @@ def _bwd_kernel(
         k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
         v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
     else:
-        raise NotImplementedError("Non QKV-materializing backward kernel.")
+        # raise NotImplementedError("Non QKV-materializing backward kernel.")
         k, v = None, None
 
     def _fn(start_q: int, carry):
@@ -510,11 +540,34 @@ def _bwd_kernel(
 
         if nomat:
             assert q is None and k is None
-            bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-            x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
-            x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+
+            bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> rq rk lq lk")
+
+            # NOTE: the following double scan is equivalent to the following reduciton
+            # but uses less memory sinc jax.lax.scan without unrolling is guaranteed
+            # to reuse input/output buffers. Prior implementation:
+            # x = einops.einsum(ka, bb, "lk rk h, lq lk rq rk -> lq lk rq h") / rank_k
+            # x = einops.einsum(qa, x, "lq rq h, lq lk rq h -> h lq lk") / rank_q
+
+            def accum_logits(out, i: Int, j: Int) -> Float[Array, "h lq lk"]:
+                return out + einops.einsum(
+                    qa[:, i], ka[:, j], bb[i, j, :, :], "lq h, lk h, lq lk -> h lq lk"
+                )
+
+            x, _ = jax.lax.scan(  # over rank_q
+                lambda o, i: jax.lax.scan(  # over rank_k
+                    lambda o, j: (accum_logits(o, i, j), None),
+                    init=o,
+                    xs=jnp.arange(rank_k),
+                ),
+                init=jnp.zeros(shape=(block_h, block_q, block_kv), dtype=ka.dtype),
+                xs=jnp.arange(rank_q),
+            )
+            x /= rank_q * rank_k
+
         else:
             assert q is not None and k is not None
+            bb = None
             x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
 
         assert x is not None
@@ -538,66 +591,51 @@ def _bwd_kernel(
 
         if nomat:
 
-            def accumulate_dp(dp_dv, vavb):
-                dp, dva, dvb = dp_dv
-                va, vb = vavb
+            def accumulate_dp(dp, dva, dvb, i: Int):
+                dovb = einops.einsum(do, vb[:, i], "lq h dv, lk dv -> h lq lk")
+                pva = einops.einsum(p, va[:, i], "h lq lk, lk h -> lq lk")
 
-                dovb = einops.einsum(do, vb, "lq h dv, lk dv -> h lq lk")
-                pva = einops.einsum(p, va, "h lq lk, lk h -> lq lk")  # TODO: correct?
+                dva = dva.at[:, i].set(einsum(dovb, p, "h lq lk, h lq lk -> lk h"))
+                dvb = dvb.at[:, i].set(einsum(pva, vb[:, i], "lq lk, lk dv -> lk dv"))
 
-                dva += einops.einsum(dovb, p, "h lq lk, h lq lk -> h lk")
-                dvb += einops.einsum(pva, vb, "lq lk, lk dv -> lq dv")  # TODO: correct?
-
-                dp += einops.einsum(dovb, va, "h lq lk, lk h -> h lq lk")
-
-                return (dp, dva, dvb), None
+                dp += einops.einsum(dovb, va[:, i], "h lq lk, lk h -> h lq lk")
+                return dp, dva, dvb
 
             (dp, dva, dvb), _ = jax.lax.scan(
-                accumulate_dp,
+                lambda dp_dva_dvb, i: (accumulate_dp(*dp_dva_dvb, i), None),
                 init=(
                     einops.repeat(-di, "lq h -> h lq lk", lk=k_len),  # dp
                     jnp.zeros_like(va),  # dva
                     jnp.zeros_like(vb),  # dvb
                 ),
-                xs=(
-                    # gotta rearrange them to have leading axes
-                    einops.rearrange(va, "lk rk h -> rk lk h"),
-                    einops.rearrange(vb, "lk rk dv -> rk lk dv"),
-                ),
+                xs=jnp.arange(rank_k),
             )
             ds = p * dp * sm_scale
 
-            pqa = einops.einsum(p, qa, "h lq lk, lq rq h -> lq lk rq")
-            pka = einops.einsum(q, ka, "h lq lk, lk rk h -> lq lk rk")
+            # compute dk
+            assert bb is not None
 
-            qbkb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> lq lk rq rk")
-            qaka = einops.einsum(qa, ka, "lq rq h, lk rk, h -> lq lk rq rk")
+            dqa, dqb, dka, dkb = jax.tree.map(jnp.zeros_like, [qa, qb, ka, kb])
 
-            def accumulate_dk(dka_dkb, ka_kb):
-                dka, dkb = dka_dkb
-                ka, kb, qbkb_ = ka_kb
+            for i in range(rank_q):
+                for j in range(rank_k):
+                    # dk = ds @ dq
+                    # dka = ds (qa qb) kb = (ds qa) (qb kb)
+                    # dkb = ds (qa qb) ka = (ds qa ka) qb
+                    dsqa = einops.einsum(ds, qa[:, i], "h lq lk, lq h -> h lq lk")
 
-                dka += einops.einsum(pqa, qbkb_, "lq lk rq, lq lk rq -> lk h")
+                    dka[:, j] += einsum(dsqa, bb[i, j], "h lq lk, lq lk -> lk h")
+                    lqlk = einops.einsum(dsqa, ka[:, j], "h lq lk, lk h -> lq lk")
+                    dkb[:, j] += einops.einsum(lqlk, qb[:, i], "lq lk, lq dk", "lk dk")
 
-                # TODO: ... really not sure about this one ...
-                pqaqb = einops.einsum(pqa, ka, "lq lk rq, lk h -> lq lk rq")
-                dkb += einops.einsum(pqaqb, qb, "lq lk rq, lq rq dk -> lk dk")
+                    # dq = ds @ dk
+                    # dqa = ds (ka kb) qb = (ds ka) (kb qb)
+                    # dqb = ds (ka kb) qa = (ds qa ka) kb
+                    dska = einops.einsum(ds, ka[:, j], "h lq lk, lk h -> h lq lk")
 
-            dka, dkb = jax.lax.scan(
-                accumulate_dk,
-                init=(
-                    jnp.zeros_like(ka),
-                    jnp.zeros_like(kb),
-                ),
-                xs=(
-                    einops.rearrange(ka, "lk rk h -> rk lk h"),
-                    einops.rearrange(kb, "lk rk dk -> rk lk dk"),
-                ),
-            )
-
-            def accumulate_dq(): ...
-
-            dqa, dqb = jax.lax.scan(accumulate_dq, ...)
+                    dqa[:, i] += einsum(dska, bb[i, j], "h lq lk, lq lk -> lq h")
+                    lqlk = einops.einsum(dska, qa[:, i], "h lq lk, lq h -> lq lk")
+                    dqb[:, i] += einops.einsum(lqlk, kb[:, j], "lq lk, lk dk -> lq dk")
 
         else:
             assert v is not None
@@ -621,6 +659,8 @@ def _bwd_kernel(
             dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
             dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
 
+        # NOTE: on TPU no need for atomic add as long as we'll be processing all query
+        # chunks sequentially.
         pl.atomic_add(dqa_ref, (q_slice, slice(None), slice(None)), dqa)
         pl.atomic_add(dqb_ref, (q_slice, slice(None), slice(None)), dqb)
 
