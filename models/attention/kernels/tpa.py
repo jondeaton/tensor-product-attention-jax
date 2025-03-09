@@ -588,27 +588,32 @@ def _bwd_kernel(
         p = jnp.where(jnp.isnan(p), 0, p)
 
         if nomat:
-            raise NotImplementedError()
+            # raise NotImplementedError()
 
             # dv = p do
             # dva = p (do vb)
             # dvb = p (do va)
             def accumulate_dp(dp, dva, dvb, i: Int):
                 dovb = einops.einsum(do, vb[:, i], "lq h dv, lk dv -> h lq lk")
-                pva = einops.einsum(p, va[:, i], "h lq lk, lk h -> lq lk")
 
-                dva = dva.at[:, i].set(einsum(dovb, p, "h lq lk, h lq lk -> lk h"))
-                dvb = dvb.at[:, i].set(einsum(pva, vb[:, i], "lq lk, lk dv -> lk dv"))
+                dva = dva.at[:, i].add(
+                    einsum(dovb, p, "h lq lk, h lq lk -> lk h") / rank_k
+                )
 
-                dp += einops.einsum(dovb, va[:, i], "h lq lk, lk h -> h lq lk")
+                pva = einops.einsum(p, va[:, i], "h lq lk, lk h -> h lq lk")
+                dvb = dvb.at[:, i].add(
+                    einsum(pva, do, "h lq lk, lq h dv -> lk dv") / rank_k
+                )
+
+                dp += einops.einsum(dovb, va[:, i], "h lq lk, lk h -> h lq lk") / rank_k
                 return dp, dva, dvb
 
-            (dp, dva_, dvb_), _ = jax.lax.scan(  # over rank_k
+            (dp, dva, dvb), _ = jax.lax.scan(  # over rank_k
                 lambda dp_dva_dvb, i: (accumulate_dp(*dp_dva_dvb, i), None),
                 init=(
                     einops.repeat(-di, "lq h -> h lq lk", lk=k_len),  # dp
-                    jnp.zeros_like(va),  # dva
-                    jnp.zeros_like(vb),  # dvb
+                    dva,
+                    dvb,
                 ),
                 xs=jnp.arange(rank_k),
             )
@@ -620,8 +625,8 @@ def _bwd_kernel(
             dkb += einops.einsum(dk, ka, "lk h dk, lk rk h -> lk rk dk") / rank_k
 
             dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
-            dqa += einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
-            dqb += einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
+            dqa = einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
+            dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
 
             # TODO : convert this into jax.lax.scan
             #
@@ -670,7 +675,10 @@ def _bwd_kernel(
             dqb = einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
 
         # NOTE: on TPU no need for atomic add as long as we'll be processing all query
-        # chunks sequentially.
+        # chunks sequentially. This might actually turn into an issue if we have so
+        # many shared heads that we have insufficient parallelism to feed both cores
+        # of megacore TPUs ...
+        # As long as we # have micromatch size of 2 might be ok lmao
         pl.atomic_add(dqa_ref, (q_slice, slice(None), slice(None)), dqa)
         pl.atomic_add(dqb_ref, (q_slice, slice(None), slice(None)), dqb)
 
