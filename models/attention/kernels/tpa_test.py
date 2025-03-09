@@ -57,12 +57,14 @@ def reference(
 @pytest.mark.parametrize("rank_k", [1, 4])
 @pytest.mark.parametrize("nomat", [False, True])
 @pytest.mark.parametrize(
-    "batch_size,lq,lk,h,dk,dv",
+    "batch_size,lq,lk,h,dk,dv,segment_size",
     [
-        (1, 8, 8, 1, 4, 6),
-        (2, 1024, 128, 2, 3, 5),
-        (2, 128, 1024, 2, 3, 5),
-        (1, 1024, 1024, 2, 3, 5),
+        (1, 8, 8, 1, 4, 6, 8),
+        (2, 1024, 128, 2, 3, 5, 42),
+        (2, 1024, 128, 2, 3, 5, None),
+        (2, 128, 1024, 2, 3, 5, 42),
+        (2, 128, 1024, 2, 3, 5, None),
+        (1, 1024, 1024, 2, 3, 5, 321),
     ],
 )
 def test_tpa_forward(
@@ -75,7 +77,9 @@ def test_tpa_forward(
     h: int,
     dk: int,
     dv: int,
+    segment_size: int | None,
 ):
+    # pytest.skip()
     key = jax.random.PRNGKey(0)
     keys = jax.random.split(key, 3)
 
@@ -83,9 +87,16 @@ def test_tpa_forward(
     k = jax.random.uniform(keys[1], shape=(batch_size, lk, rank_k, (h + dk)))
     v = jax.random.uniform(keys[2], shape=(batch_size, lk, rank_k, (h + dv)))
 
-    q_segment_ids = einops.repeat(jnp.arange(lq) // 42, "l -> b l", b=batch_size)
-    kv_segment_ids = einops.repeat(jnp.arange(lk) // 42, "l -> b l", b=batch_size)
-
+    if segment_size is not None:
+        q_segment_ids = einops.repeat(
+            jnp.arange(lq) // segment_size, "l -> b l", b=batch_size
+        )
+        kv_segment_ids = einops.repeat(
+            jnp.arange(lk) // segment_size, "l -> b l", b=batch_size
+        )
+    else:
+        q_segment_ids = jnp.zeros(shape=(batch_size, lq), dtype=int)
+        kv_segment_ids = jnp.zeros(shape=(batch_size, lk), dtype=int)
     out_ref = reference(
         q,
         k,
@@ -115,12 +126,14 @@ def test_tpa_forward(
 @pytest.mark.parametrize("rank_k", [1, 4])
 @pytest.mark.parametrize("nomat", [False, True])
 @pytest.mark.parametrize(
-    "batch_size,lq,lk,h,dim_k,dim_v",
+    "batch_size,lq,lk,h,dim_k,dim_v,segment_size",
     [
-        (1, 8, 8, 1, 4, 6),
-        (2, 1024, 128, 2, 3, 5),
-        (2, 128, 1024, 2, 3, 5),
-        (1, 1024, 1024, 2, 3, 5),
+        (1, 8, 8, 1, 4, 6, 8),
+        (2, 1024, 128, 2, 3, 5, 42),
+        (2, 1024, 128, 2, 3, 5, None),
+        (2, 128, 1024, 2, 3, 5, 42),
+        (2, 128, 1024, 2, 3, 5, None),
+        (1, 1024, 1024, 2, 3, 5, 321),
     ],
 )
 def test_tpa_backwards(
@@ -133,16 +146,25 @@ def test_tpa_backwards(
     h: int,
     dim_k: int,
     dim_v: int,
+    segment_size: int | None,
 ):
     key = jax.random.PRNGKey(0)
     keys = jax.random.split(key, 4)
 
-    q = jax.random.uniform(keys[0], shape=(batch_size, lq, rank_q, (h + dim_k)))
-    k = jax.random.uniform(keys[1], shape=(batch_size, lk, rank_k, (h + dim_k)))
-    v = jax.random.uniform(keys[2], shape=(batch_size, lk, rank_k, (h + dim_v)))
+    q = jax.random.normal(keys[0], shape=(batch_size, lq, rank_q, (h + dim_k)))
+    k = jax.random.normal(keys[1], shape=(batch_size, lk, rank_k, (h + dim_k)))
+    v = jax.random.normal(keys[2], shape=(batch_size, lk, rank_k, (h + dim_v)))
 
-    q_segment_ids = einops.repeat(jnp.arange(lq) // 42, "l -> b l", b=batch_size)
-    kv_segment_ids = einops.repeat(jnp.arange(lk) // 42, "l -> b l", b=batch_size)
+    if segment_size is not None:
+        q_segment_ids = einops.repeat(
+            jnp.arange(lq) // segment_size, "l -> b l", b=batch_size
+        )
+        kv_segment_ids = einops.repeat(
+            jnp.arange(lk) // segment_size, "l -> b l", b=batch_size
+        )
+    else:
+        q_segment_ids = jnp.zeros(shape=(batch_size, lq), dtype=int)
+        kv_segment_ids = jnp.zeros(shape=(batch_size, lk), dtype=int)
 
     def _ref(q, k, v, impl: str) -> Float[Array, ""]:
         if impl == "ref":
@@ -170,6 +192,7 @@ def test_tpa_backwards(
         return jnp.nansum(o)
 
     dq_, dk_, dv_ = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v, impl="ref")
+
     try:
         dq, dk, dv = jax.grad(_ref, argnums=(0, 1, 2))(q, k, v, impl="kernel")
     except NotImplementedError:

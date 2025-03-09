@@ -306,9 +306,9 @@ def _fwd_kernel(
         else:
             # NOTE: this strategy materializes q and k in the highest memory cache
             # but still avoids materializing them in HBM.
+            assert q is not None
             k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
             x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
-        assert x is not None
 
         x *= sm_scale
 
@@ -334,7 +334,8 @@ def _fwd_kernel(
         if nomat:
 
             def accum_out(
-                o: Float[Array, "h lq dv"], i: Int
+                o: Float[Array, "h lq dv"],
+                i: Int,
             ) -> Float[Array, "h lq dv"]:
                 pva = einops.einsum(p, va[:, i], "h lq lk, lk h -> h lq lk")
                 o_ = einops.einsum(pva, vb[:, i], "h lq lk , lk dv -> h lq dv")
@@ -500,7 +501,7 @@ def _bwd_kernel(
 
     q_len, rank_q, _ = qa_ref.shape
     k_len, rank_k, dim_k = kb_ref.shape
-    block_q, block_h, dim_v = o_ref.shape
+    _, block_h, dim_v = o_ref.shape
 
     # grid is (heads, kv block)
     start_k = pl.program_id(1)
@@ -519,13 +520,13 @@ def _bwd_kernel(
 
     kv_segment_ids = kv_segment_ids_ref[...]
 
-    # TODO: avoid materializing in the nomat case...?
     if not nomat:
-        k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
         v = einops.einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
     else:
-        # raise NotImplementedError("Non QKV-materializing backward kernel.")
-        k, v = None, None
+        v = None
+
+    # TODO: remove once nomat backwards pass is fully implemented.
+    k = einops.einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
 
     def _fn(start_q: int, carry):
         dka, dkb, dva, dvb = carry
@@ -539,8 +540,6 @@ def _bwd_kernel(
         q = einops.einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
 
         if nomat:
-            assert q is None and k is None
-
             bb = einops.einsum(qb, kb, "lq rq dk, lk rk dk -> rq rk lq lk")
 
             # NOTE: the following double scan is equivalent to the following reduciton
@@ -566,7 +565,6 @@ def _bwd_kernel(
             x /= rank_q * rank_k
 
         else:
-            assert q is not None and k is not None
             bb = None
             x = einops.einsum(q, k, "lq h dk, lk h dk -> h lq lk")
 
@@ -590,7 +588,11 @@ def _bwd_kernel(
         p = jnp.where(jnp.isnan(p), 0, p)
 
         if nomat:
+            raise NotImplementedError()
 
+            # dv = p do
+            # dva = p (do vb)
+            # dvb = p (do va)
             def accumulate_dp(dp, dva, dvb, i: Int):
                 dovb = einops.einsum(do, vb[:, i], "lq h dv, lk dv -> h lq lk")
                 pva = einops.einsum(p, va[:, i], "h lq lk, lk h -> lq lk")
@@ -601,7 +603,7 @@ def _bwd_kernel(
                 dp += einops.einsum(dovb, va[:, i], "h lq lk, lk h -> h lq lk")
                 return dp, dva, dvb
 
-            (dp, dva, dvb), _ = jax.lax.scan(
+            (dp, dva_, dvb_), _ = jax.lax.scan(  # over rank_k
                 lambda dp_dva_dvb, i: (accumulate_dp(*dp_dva_dvb, i), None),
                 init=(
                     einops.repeat(-di, "lq h -> h lq lk", lk=k_len),  # dp
@@ -612,30 +614,38 @@ def _bwd_kernel(
             )
             ds = p * dp * sm_scale
 
-            # compute dk
-            assert bb is not None
+            # TODO: this part is hard...
+            dk = einops.einsum(ds, q, "h lq lk, lq h dk -> lk h dk")
+            dka += einops.einsum(dk, kb, "lk h dk, lk rk dk -> lk rk h") / rank_k
+            dkb += einops.einsum(dk, ka, "lk h dk, lk rk h -> lk rk dk") / rank_k
 
-            dqa, dqb, dka, dkb = jax.tree.map(jnp.zeros_like, [qa, qb, ka, kb])
+            dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
+            dqa += einops.einsum(dq, qb, "lq h dk, lq rq dk -> lq rq h") / rank_q
+            dqb += einops.einsum(dq, qa, "lq h dk, lq rq h -> lq rq dk") / rank_q
 
-            for i in range(rank_q):
-                for j in range(rank_k):
-                    # dk = ds @ dq
-                    # dka = ds (qa qb) kb = (ds qa) (qb kb)
-                    # dkb = ds (qa qb) ka = (ds qa ka) qb
-                    dsqa = einops.einsum(ds, qa[:, i], "h lq lk, lq h -> h lq lk")
-
-                    dka[:, j] += einsum(dsqa, bb[i, j], "h lq lk, lq lk -> lk h")
-                    lqlk = einops.einsum(dsqa, ka[:, j], "h lq lk, lk h -> lq lk")
-                    dkb[:, j] += einops.einsum(lqlk, qb[:, i], "lq lk, lq dk", "lk dk")
-
-                    # dq = ds @ dk
-                    # dqa = ds (ka kb) qb = (ds ka) (kb qb)
-                    # dqb = ds (ka kb) qa = (ds qa ka) kb
-                    dska = einops.einsum(ds, ka[:, j], "h lq lk, lk h -> h lq lk")
-
-                    dqa[:, i] += einsum(dska, bb[i, j], "h lq lk, lq lk -> lq h")
-                    lqlk = einops.einsum(dska, qa[:, i], "h lq lk, lq h -> lq lk")
-                    dqb[:, i] += einops.einsum(lqlk, kb[:, j], "lq lk, lk dk -> lq dk")
+            # TODO : convert this into jax.lax.scan
+            #
+            # assert bb is not None
+            # dqa, dqb, dka, dkb = jax.tree.map(jnp.zeros_like, [qa, qb, ka, kb])
+            # for i in range(rank_q):
+            #     for j in range(rank_k):
+            #         # dk = ds @ dq
+            #         # dka = ds (qa qb) kb = (ds qa) (qb kb)
+            #         # dkb = ds (qa qb) ka = (ds qa ka) qb
+            #         dsqa = einops.einsum(ds, qa[:, i], "h lq lk, lq h -> h lq lk")
+            #
+            #         dka[:, j] += einsum(dsqa, bb[i, j], "h lq lk, lq lk -> lk h")
+            #         lqlk = einops.einsum(dsqa, ka[:, j], "h lq lk, lk h -> lq lk")
+            #         dkb[:, j] += einops.einsum(lqlk, qb[:, i], "lq lk, lq dk", "lk dk")
+            #
+            #         # dq = ds @ dk
+            #         # dqa = ds (ka kb) qb = (ds ka) (kb qb)
+            #         # dqb = ds (ka kb) qa = (ds qa ka) kb
+            #         dska = einops.einsum(ds, ka[:, j], "h lq lk, lk h -> h lq lk")
+            #
+            #         dqa[:, i] += einsum(dska, bb[i, j], "h lq lk, lq lk -> lq h")
+            #         lqlk = einops.einsum(dska, qa[:, i], "h lq lk, lq h -> lq lk")
+            #         dqb[:, i] += einops.einsum(lqlk, kb[:, j], "lq lk, lk dk -> lq dk")
 
         else:
             assert v is not None
@@ -651,8 +661,8 @@ def _bwd_kernel(
 
             assert q is not None
             dk = einops.einsum(ds, q, "h lq lk, lq h dk -> lk h dk")
-            dka = einops.einsum(dk, kb, "lk h dk, lk rk dk -> lk rk h") / rank_k
-            dkb = einops.einsum(dk, ka, "lk h dk, lk rk h -> lk rk dk") / rank_k
+            dka += einops.einsum(dk, kb, "lk h dk, lk rk dk -> lk rk h") / rank_k
+            dkb += einops.einsum(dk, ka, "lk h dk, lk rk h -> lk rk dk") / rank_k
 
             assert k is not None
             dq = einops.einsum(ds, k, "h lq lk, lk h dk -> lq h dk")
