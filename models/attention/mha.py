@@ -12,7 +12,7 @@ def mha(
     q: Float[Array, "b lq h dk"],
     k: Float[Array, "b lk h dk"],
     v: Float[Array, "b lk h dv"],
-    bias: Float[Array, "b lq lk"],
+    bias: Float[Array, "b lq lk"] | None = None,
     sm_scale: float = 1,
 ):
     """Multi-head attention."""
@@ -24,12 +24,14 @@ def _mha_fwd(
     q: Float[Array, "b lq h dk"],
     k: Float[Array, "b lk h dk"],
     v: Float[Array, "b lk h dv"],
-    bias: Float[Array, "b lq lk"],
+    bias: Float[Array, "b lq lk"] | None,
     sm_scale: Float,
 ) -> tuple[Float[Array, "b lq h dv"], tuple[Array, ...]]:
     """Attention."""
     x = einops.einsum(q, k, "b lq h dk, b lk h dk -> b h lq lk")
-    x = sm_scale * x + bias[:, None, :, :]
+    x = sm_scale * x
+    if bias is not None:
+        x += bias[:, None, :, :]
     p = jax.nn.softmax(x, axis=-1)
     o = einops.einsum(p, v, "b h lq lk, b lk h dv -> b lq h dv")
     return o, (p, v, q, k, sm_scale)
