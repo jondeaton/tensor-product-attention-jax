@@ -1,4 +1,18 @@
-"""Tensor Product Attention: Flash Pallas Kernels."""
+"""Tensor Product Attention: Flash Pallas Kernels.
+
+one issue im realizing with TPA in general:
+
+    - if in order to gain benefits of reduced computation from non-materializing,
+        we *must* use at least 16 heads per kernel. This could interact negatively
+        with Tensor Parallelism, where we split heads across devices and then
+        end up with generally a small number of heads per device.
+
+    - this would generally push us towards more heads on each device, reducing
+        tensor-parallel rank.
+
+    - Perhaps there is a less explored design space in transformers where you have
+      a really large number of heads with small head-dim?
+"""
 
 from __future__ import annotations
 
@@ -287,6 +301,19 @@ def _fwd_kernel(
     q_segment_ids = q_segment_ids_ref[...] if q_segment_ids_ref is not None else None
 
     if not nomat:
+        """
+        NOTE: yeah looks like compiling einsum ain't gonna work HAHA
+
+        jax._src.pallas.mosaic.lowering.LoweringException:
+        NotImplementedError: Only 2D tensors supported in dot; received:
+             [ShapedArray (bfloat16[128,6,11), ShapedArray(bfloat16[128,6,128])]
+
+        Additional diagnostics:
+        Failing jaxpr equation: a:bf16[128,1,128] = dot_general[
+            dimension_numbers=(([1], [1]), ([0], [O]))
+            preferred_element_type=bfloat16
+        ] b c
+        """
         q = einsum(qa, qb, "lq rq h, lq rq dk -> lq h dk") / rank_q
     else:
         q = None
@@ -413,7 +440,6 @@ def _fwd_kernel(
 
     # Store final output.
     o_ref[:, heads_slice, :] = einops.rearrange(o, "h l d -> l h d")
-    # BUG: why is this float32??
     l_ref[..., heads_slice] = einops.rearrange(l, "h l -> l h")
 
 
@@ -463,53 +489,6 @@ def _fwd(
     assert q_len % block_q == 0, (q_len, block_q)
     assert k_len % block_kv == 0, (k_len, block_kv)
 
-    """
-    one issue im realizing with TPA in general: 
-
-        - if in order to gain benefits of reduced computation from non-materializing,
-            we *must* use at least 16 heads per kernel. This could interact negatively
-            with Tensor Parallelism, where we split heads across devices...
-
-        - this would generally push us towards more heads on each device, reducing
-            tensor-parallel rank.
-
-        - Perhaps there is a less explored design space in transformers where you have
-          a really large number of heads with small head-dim?
-    """
-
-    """
-    ValueError: The Pallas TPU lowering currently requires that the last
-    two dimensions of your block shape are 
-        - divisible by 8 and 128 respectively
-        - or be equal to the respective dimensions of the overall array.
-        
-    Block spec for args[0] in pallas_call tpa_fwd_batched ... has
-    
-    block shape (Mapped, 128, 6, 1)
-    array shape (2, 8192, 6, 32)
-    index_map { lambda ; a:132[] b:132[] c:i32[]. let in (a, c, 0, b) },
-    in memory space None.
-
-
-    Okay so the issue here is that Pallas was basically only designed to support
-    flash attention LOL so expectes the final two dimensions to be
-
-        num_heads, d_head
-
-    The issue isn't being caused by the rank_q/k axes because we're not slicing them
-    in the BlockSpec.
-
-    The issue is coming from the head dimension of the qa/ka/va axes. The easiest
-    way to deal with this would just be to not slice the heads in the BlockSpec, but 
-    just selectively load only the slice of heads according to which kernel program
-    we're in.
-    
-    This work-around would generally result in Pallas pipelining loading unnecessary
-    data into VMEM. However, in this case these arrays are very small since its just
-    rank * num_heads scalars, and honestly, I think generally we're going to be avoiding
-    slicing along this dimension anyways since we want like 32 heads per kernel.
-    """
-
     return pl.pallas_call(
         functools.partial(
             _fwd_kernel,
@@ -548,7 +527,7 @@ def _fwd(
         ],
         out_shape=[
             jax.ShapeDtypeStruct(shape=(q_len, num_heads, dim_v), dtype=q.dtype),  # out
-            jax.ShapeDtypeStruct(shape=(q_len, num_heads), dtype=jnp.float32),  # lse
+            jax.ShapeDtypeStruct(shape=(q_len, num_heads), dtype=q.dtype),  # lse
         ],
         compiler_params=dict(
             # TODO: tune these compiler params?
@@ -606,11 +585,11 @@ def _bwd_kernel(
 
     start_k = pl.program_id(1)
 
-    dka = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=jnp.float32)
-    dkb = jnp.zeros(shape=[block_kv, rank_k, dim_k], dtype=jnp.float32)
+    dka = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=ka_ref.dtype)
+    dkb = jnp.zeros(shape=[block_kv, rank_k, dim_k], dtype=kb_ref.dtype)
 
-    dva = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=jnp.float32)
-    dvb = jnp.zeros(shape=[block_kv, rank_k, dim_v], dtype=jnp.float32)
+    dva = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=va_ref.dtype)
+    dvb = jnp.zeros(shape=[block_kv, rank_k, dim_v], dtype=vb_ref.dtype)
 
     ka = ka_ref[..., heads_slice]
     kb = kb_ref[...]
