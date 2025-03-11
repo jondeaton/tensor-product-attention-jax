@@ -14,6 +14,10 @@ from einops import einsum
 from jaxtyping import Int, Float, Array
 
 
+# TODO: support sparsity following Splash Attention pattern.
+# from jax.experimental.pallas.ops.tpu import splash_attention
+
+
 @dataclasses.dataclass
 class BlockSizes:
     """Configures sizes of input array slices for kernels."""
@@ -118,7 +122,7 @@ def _tpa_fwd(
     interpret: bool,
 ) -> tuple[
     Float[Array, "b lq h dv"],
-    tuple[Array, ...],
+    tuple[Array | None, ...],
 ]:
     if block_sizes is None:
         block_sizes = BlockSizes()
@@ -199,7 +203,7 @@ def _tpa_bwd(
 tpa.defvjp(_tpa_fwd, _tpa_bwd)
 
 
-def _lse(x: jax.Array):
+def _lse(x: Float[Array, "... n"]) -> Float[Array, "..."]:
     """Logsumexp over final dimension."""
     m = jnp.max(x, axis=-1)
     l_ = m + jnp.log(jnp.sum(jnp.exp(x - m[..., None]), axis=-1))
@@ -207,7 +211,7 @@ def _lse(x: jax.Array):
     return jnp.where(jnp.isneginf(m), neginf, l_)
 
 
-def _lse_accum(a: jax.Array, b: jax.Array) -> jax.Array:
+def _lse_accum(a: Float[Array, "..."], b: Float[Array, "..."]) -> Float[Array, "..."]:
     """Accumulat log-sum-exp.
 
     let a > b
@@ -607,12 +611,11 @@ def _bwd_kernel(
     kv_segment_ids = kv_segment_ids_ref[...] if kv_segment_ids_ref is not None else None
 
     if not nomat:
+        k = einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
         v = einsum(va, vb, "lk rk h, lk rk dv -> lk h dv") / rank_k
     else:
+        k = None
         v = None
-
-    # TODO: remove once nomat backwards pass is fully implemented.
-    k = einsum(ka, kb, "lk rk h, lk rk dk -> lk h dk") / rank_k
 
     def _fn(start_q: int, carry):
         dka, dkb, dva, dvb = carry
@@ -662,6 +665,7 @@ def _bwd_kernel(
         x *= sm_scale
 
         if q_segment_ids is not None:
+            assert kv_segment_ids is not None
             mask = q_segment_ids[:, None] == kv_segment_ids[None, :]
         else:
             mask = None
@@ -686,8 +690,6 @@ def _bwd_kernel(
         p = jnp.where(jnp.isnan(p), 0, p)
 
         if nomat:
-            # raise NotImplementedError()
-
             # dv = p do
             # dva = p (do vb)
             # dvb = p (do va)
@@ -748,7 +750,7 @@ def _bwd_kernel(
 
             (dqa, dqb), _ = jax.lax.scan(  # over rank_q
                 lambda dqa_dqb, i: jax.lax.scan(  # over rank_k
-                    lambda dqa_dqb, j: accumulate_dq(*dqa_dqb, i, j),
+                    lambda dqa_dqb, j: accumulate_dq(*dqa_dqb, i, j),  # type: ignore
                     init=dqa_dqb,
                     xs=jnp.arange(rank_k),
                 ),
@@ -762,7 +764,6 @@ def _bwd_kernel(
                 i: Int,
                 j: Int,
             ):
-
                 assert bb is not None
 
                 dsqa = einsum(ds, qa[:, i], "h lq lk, lq h -> h lq lk") / rank_q
