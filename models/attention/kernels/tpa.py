@@ -525,11 +525,11 @@ def _fwd(
             pl.cdiv(q_len, block_q),
         ),
         in_specs=[
-            pl.BlockSpec((block_q, rank_q, block_h), lambda h, lq: (lq, 0, 0)),  # qa
+            pl.BlockSpec((block_q, rank_q, num_heads), lambda h, lq: (lq, 0, 0)),  # qa
             pl.BlockSpec((block_q, rank_q, dim_k), lambda _, lq: (lq, 0, 0)),  # qb
-            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, 0)),  # ka
+            pl.BlockSpec((k_len, rank_k, num_heads), lambda h, _: (0, 0, 0)),  # ka
             pl.BlockSpec((k_len, rank_k, dim_k), lambda *_: (0, 0, 0)),  # kb
-            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, 0)),  # va
+            pl.BlockSpec((k_len, rank_k, num_heads), lambda h, _: (0, 0, 0)),  # va
             pl.BlockSpec((k_len, rank_k, dim_v), lambda *_: (0, 0, 0)),  # vb
             (
                 pl.BlockSpec((block_q,), lambda _, lq: (lq,))  # q_segment_ids
@@ -598,9 +598,12 @@ def _bwd_kernel(
 
     q_len, rank_q, _ = qa_ref.shape
     k_len, rank_k, dim_k = kb_ref.shape
-    _, block_h, dim_v = o_ref.shape
+    _, _, dim_v = o_ref.shape
 
     # grid is (heads, kv block)
+    head_index: Int = pl.program_id(0)
+    heads_slice = pl.dslice(start=head_index * block_h, size=block_h)
+
     start_k = pl.program_id(1)
 
     dka = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=jnp.float32)
@@ -609,10 +612,10 @@ def _bwd_kernel(
     dva = jnp.zeros(shape=[block_kv, rank_k, block_h], dtype=jnp.float32)
     dvb = jnp.zeros(shape=[block_kv, rank_k, dim_v], dtype=jnp.float32)
 
-    ka = ka_ref[...]
+    ka = ka_ref[..., heads_slice]
     kb = kb_ref[...]
 
-    va = va_ref[...]
+    va = va_ref[..., heads_slice]
     vb = vb_ref[...]
 
     kv_segment_ids = kv_segment_ids_ref[...] if kv_segment_ids_ref is not None else None
@@ -629,7 +632,7 @@ def _bwd_kernel(
 
         q_slice = pl.dslice(start=start_q * block_q, size=block_q)
 
-        qa = qa_ref[q_slice, ...]
+        qa = qa_ref[q_slice, ..., heads_slice]
         qb = qb_ref[q_slice, ...]
 
         if q_segment_ids_ref is not None:
@@ -688,9 +691,9 @@ def _bwd_kernel(
         if mask is not None:
             x = jnp.where(mask[None, ...], x, -jnp.inf)
 
-        l = l_ref[q_slice, ...]
-        do = do_ref[q_slice, ...]
-        di = delta_ref[q_slice, ...]
+        l = l_ref[q_slice, heads_slice]
+        do = do_ref[q_slice, heads_slice, :]
+        di = delta_ref[q_slice, heads_slice]
 
         l = einops.rearrange(l, "lq h -> h lq 1")
         p: Float[Array, "h lq lk"] = jnp.exp(x - l)
@@ -821,7 +824,7 @@ def _bwd_kernel(
         # many shared heads that we have insufficient parallelism to feed both cores
         # of megacore TPUs ...
         # As long as we # have micromatch size of 2 might be ok lmao
-        pl.atomic_add(dqa_ref, (q_slice, slice(None), slice(None)), dqa)
+        pl.atomic_add(dqa_ref, (q_slice, slice(None), heads_slice), dqa)
         pl.atomic_add(dqb_ref, (q_slice, slice(None), slice(None)), dqb)
 
         return dka, dkb, dva, dvb
@@ -832,9 +835,9 @@ def _bwd_kernel(
     dka, dkb, dva, dvb = jax.lax.fori_loop(0, num_blocks, _fn, (dka, dkb, dva, dvb))
 
     # Write outputs to HBM.
-    dka_ref[...] = dka.astype(dka_ref.dtype)
+    dka_ref[..., heads_slice] = dka.astype(dka_ref.dtype)
     dkb_ref[...] = dkb.astype(dkb_ref.dtype)
-    dva_ref[...] = dva.astype(dva_ref.dtype)
+    dva_ref[..., heads_slice] = dva.astype(dva_ref.dtype)
     dvb_ref[...] = dvb.astype(dvb_ref.dtype)
 
 
@@ -887,8 +890,8 @@ def _bwd(
             debug=debug,
             interpret=interpret,
         ),
-        in_axes=[0, 0, 0],
-        out_axes=0,
+        in_axes=[1, 1, 1],
+        out_axes=1,
     )(o, do, l)
 
     # initialize dq and use input aliasing https://github.com/jax-ml/jax/discussions/23272
@@ -912,11 +915,11 @@ def _bwd(
             pl.cdiv(k_len, block_kv),
         ),
         in_specs=[
-            pl.BlockSpec((q_len, rank_q, block_h), lambda h, lk: (0, 0, h)),  # qa
+            pl.BlockSpec((q_len, rank_q, num_heads), lambda h, lk: (0, 0, 0)),  # qa
             pl.BlockSpec((q_len, rank_q, dim_k), lambda _, lk: (0, 0, 0)),  # qb
-            pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # ka
+            pl.BlockSpec((block_kv, rank_k, num_heads), lambda h, lk: (lk, 0, 0)),  # ka
             pl.BlockSpec((block_kv, rank_k, dim_k), lambda _, lk: (lk, 0, 0)),  # kb
-            pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # va
+            pl.BlockSpec((block_kv, rank_k, num_heads), lambda h, lk: (lk, 0, 0)),  # va
             pl.BlockSpec((block_kv, rank_k, dim_v), lambda _, lk: (lk, 0, 0)),  # vb
             # control
             (
@@ -930,20 +933,24 @@ def _bwd(
                 else None
             ),
             # outputs
-            pl.BlockSpec((q_len, block_h, dim_v), lambda h, lk: (0, h, 0)),  # o
-            pl.BlockSpec((q_len, block_h), lambda h, lk: (0, h)),  # l
-            pl.BlockSpec((q_len, block_h, dim_v), lambda h, lk: (0, h, 0)),  # do
-            pl.BlockSpec((q_len, block_h), lambda h, lk: (0, h)),  # delta
+            pl.BlockSpec((q_len, num_heads, dim_v), lambda h, lk: (0, 0, 0)),  # o
+            pl.BlockSpec((q_len, num_heads), lambda h, lk: (0, 0)),  # l
+            pl.BlockSpec((q_len, num_heads, dim_v), lambda h, lk: (0, 0, 0)),  # do
+            pl.BlockSpec((q_len, num_heads), lambda h, lk: (0, 0)),  # delta
             # aliases: dqa, dqb
-            pl.BlockSpec((block_q, rank_q, block_h), lambda h, lq: (lq, 0, h)),  # dqa
+            pl.BlockSpec((block_q, rank_q, num_heads), lambda h, lq: (lq, 0, 0)),  # dqa
             pl.BlockSpec((block_q, rank_q, dim_k), lambda _, lq: (lq, 0, 0)),  # dqb
         ],
         out_specs=[
-            pl.BlockSpec((q_len, rank_q, block_h), lambda h, lk: (0, 0, h)),  # dqa
+            pl.BlockSpec((q_len, rank_q, num_heads), lambda h, lk: (0, 0, 0)),  # dqa
             pl.BlockSpec((q_len, rank_q, dim_k), lambda _, lk: (0, 0, 0)),  # dqb
-            pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # dka
+            pl.BlockSpec(
+                (block_kv, rank_k, num_heads), lambda h, lk: (lk, 0, 0)
+            ),  # dka
             pl.BlockSpec((block_kv, rank_k, dim_k), lambda _, lk: (lk, 0, 0)),  # dkb
-            pl.BlockSpec((block_kv, rank_k, block_h), lambda h, lk: (lk, 0, h)),  # dva
+            pl.BlockSpec(
+                (block_kv, rank_k, num_heads), lambda h, lk: (lk, 0, 0)
+            ),  # dva
             pl.BlockSpec((block_kv, rank_k, dim_v), lambda _, lk: (lk, 0, 0)),  # dvb
         ],
         out_shape=[
