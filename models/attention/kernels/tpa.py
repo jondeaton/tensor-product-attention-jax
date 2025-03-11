@@ -203,7 +203,8 @@ def _lse(x: jax.Array):
     """Logsumexp over final dimension."""
     m = jnp.max(x, axis=-1)
     l_ = m + jnp.log(jnp.sum(jnp.exp(x - m[..., None]), axis=-1))
-    return jnp.where(jnp.isneginf(m), -jnp.inf, l_)
+    neginf = jnp.array(-jnp.inf, dtype=x.dtype)
+    return jnp.where(jnp.isneginf(m), neginf, l_)
 
 
 def _lse_accum(a: jax.Array, b: jax.Array) -> jax.Array:
@@ -219,7 +220,8 @@ def _lse_accum(a: jax.Array, b: jax.Array) -> jax.Array:
     max = jnp.maximum(a, b)
     min = jnp.minimum(a, b)
     lse = max + jnp.log(1 + jnp.exp(min - max))
-    return jnp.where(jnp.isneginf(max), -jnp.inf, lse)
+    neginf = jnp.array(-jnp.inf, dtype=a.dtype)
+    return jnp.where(jnp.isneginf(max), neginf, lse)
 
 
 def _fwd_kernel(
@@ -392,8 +394,8 @@ def _fwd_kernel(
         kv_len = ka_ref.shape[0]
         num_kv_blocks = pl.cdiv(kv_len, block_kv)
 
-    o = jnp.zeros(shape=(block_h, block_q, dv), dtype=jnp.float32)
-    l = jnp.zeros(shape=(block_h, block_q), dtype=jnp.float32) - jnp.inf
+    o = jnp.zeros(shape=(block_h, block_q, dv), dtype=vb_ref.dtype)
+    l = jnp.zeros(shape=(block_h, block_q), dtype=qa_ref.dtype) - jnp.inf
     o, l = jax.lax.fori_loop(0, num_kv_blocks, _scan_fn, (o, l))
 
     # TODO: consider defining empty attention to be zero instead of nan to avoid this
@@ -402,6 +404,7 @@ def _fwd_kernel(
 
     # Store final output.
     o_ref[...] = einops.rearrange(o, "h l d -> l h d")
+    # BUG: why is this float32??
     l_ref[...] = einops.rearrange(l, "h l -> l h")
 
 
@@ -450,6 +453,53 @@ def _fwd(
 
     assert q_len % block_q == 0, (q_len, block_q)
     assert k_len % block_kv == 0, (k_len, block_kv)
+
+    """
+    one issue im realizing with TPA in general: 
+
+        - if in order to gain benefits of reduced computation from non-materializing,
+            we *must* use at least 16 heads per kernel. This could interact negatively
+            with Tensor Parallelism, where we split heads across devices...
+
+        - this would generally push us towards more heads on each device, reducing
+            tensor-parallel rank.
+
+        - Perhaps there is a less explored design space in transformers where you have
+          a really large number of heads with small head-dim?
+    """
+
+    """
+    ValueError: The Pallas TPU lowering currently requires that the last
+    two dimensions of your block shape are 
+        - divisible by 8 and 128 respectively
+        - or be equal to the respective dimensions of the overall array.
+        
+    Block spec for args[0] in pallas_call tpa_fwd_batched ... has
+    
+    block shape (Mapped, 128, 6, 1)
+    array shape (2, 8192, 6, 32)
+    index_map { lambda ; a:132[] b:132[] c:i32[]. let in (a, c, 0, b) },
+    in memory space None.
+
+
+    Okay so the issue here is that Pallas was basically only designed to support
+    flash attention LOL so expectes the final two dimensions to be
+
+        num_heads, d_head
+
+    The issue isn't being caused by the rank_q/k axes because we're not slicing them
+    in the BlockSpec.
+
+    The issue is coming from the head dimension of the qa/ka/va axes. The easiest
+    way to deal with this would just be to not slice the heads in the BlockSpec, but 
+    just selectively load only the slice of heads according to which kernel program
+    we're in.
+    
+    This work-around would generally result in Pallas pipelining loading unnecessary
+    data into VMEM. However, in this case these arrays are very small since its just
+    rank * num_heads scalars, and honestly, I think generally we're going to be avoiding
+    slicing along this dimension anyways since we want like 32 heads per kernel.
+    """
 
     return pl.pallas_call(
         functools.partial(
