@@ -242,6 +242,7 @@ def _fwd_kernel(
     sm_scale: float,
     causal: bool,
     block_kv: int,
+    block_h: int,
     nomat: bool,
 ):
     """TPA forward pallas kernel.
@@ -274,10 +275,14 @@ def _fwd_kernel(
     """
     rank_q = qa_ref.shape[1]
     rank_k = ka_ref.shape[1]
-    block_q, block_h, dv = o_ref.shape
+    block_q, num_heads, dv = o_ref.shape
 
-    start_q = pl.program_id(1)
-    qa = qa_ref[...]
+    h_index: Int = pl.program_id(0)
+    heads_slice = pl.dslice(h_index * block_h, block_h)
+
+    q_index: Int = pl.program_id(1)
+
+    qa = qa_ref[..., heads_slice]
     qb = qb_ref[...]
     q_segment_ids = q_segment_ids_ref[...] if q_segment_ids_ref is not None else None
 
@@ -293,7 +298,7 @@ def _fwd_kernel(
 
         kv_slice = pl.dslice(start_k * block_kv, block_kv)
 
-        ka = ka_ref[kv_slice, slice(None), slice(None)]
+        ka = ka_ref[kv_slice, slice(None), heads_slice]
         kb = kb_ref[kv_slice, slice(None), slice(None)]
 
         # Compute attention logits for all.
@@ -342,7 +347,7 @@ def _fwd_kernel(
             mask = None
 
         if causal:
-            span_q = start_q * block_q + jnp.arange(block_q)
+            span_q = q_index * block_q + jnp.arange(block_q)
             span_k = start_k * block_kv + jnp.arange(block_kv)
             causal_mask = span_q[:, None] >= span_k[None, :]
             if mask is not None:
@@ -360,7 +365,7 @@ def _fwd_kernel(
         p = jnp.exp(log_p)
         p = jnp.where(jnp.isneginf(l[..., None]), 0.0, p)  # no data yet -> zero.
 
-        va = va_ref[kv_slice, slice(None), slice(None)]
+        va = va_ref[kv_slice, slice(None), heads_slice]
         vb = vb_ref[kv_slice, slice(None), slice(None)]
 
         if nomat:
@@ -393,7 +398,7 @@ def _fwd_kernel(
         return o, l
 
     if causal:
-        num_kv_blocks = jax.lax.div(block_q * (start_q + 1) + block_kv - 1, block_kv)
+        num_kv_blocks = jax.lax.div(block_q * (q_index + 1) + block_kv - 1, block_kv)
     else:
         kv_len = ka_ref.shape[0]
         num_kv_blocks = pl.cdiv(kv_len, block_kv)
@@ -407,9 +412,9 @@ def _fwd_kernel(
     o = jnp.where(jnp.isneginf(l)[..., None], jnp.nan, o)
 
     # Store final output.
-    o_ref[...] = einops.rearrange(o, "h l d -> l h d")
+    o_ref[:, heads_slice, :] = einops.rearrange(o, "h l d -> l h d")
     # BUG: why is this float32??
-    l_ref[...] = einops.rearrange(l, "h l -> l h")
+    l_ref[..., heads_slice] = einops.rearrange(l, "h l -> l h")
 
 
 def _fwd(
@@ -511,18 +516,20 @@ def _fwd(
             sm_scale=sm_scale,
             causal=causal,
             block_kv=block_kv,
+            block_h=block_h,
             nomat=nomat,
         ),
         grid=(
+            # TODO: switch these around? idk
             pl.cdiv(num_heads, block_h),
             pl.cdiv(q_len, block_q),
         ),
         in_specs=[
-            pl.BlockSpec((block_q, rank_q, block_h), lambda h, lq: (lq, 0, h)),  # qa
+            pl.BlockSpec((block_q, rank_q, block_h), lambda h, lq: (lq, 0, 0)),  # qa
             pl.BlockSpec((block_q, rank_q, dim_k), lambda _, lq: (lq, 0, 0)),  # qb
-            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # ka
+            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, 0)),  # ka
             pl.BlockSpec((k_len, rank_k, dim_k), lambda *_: (0, 0, 0)),  # kb
-            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, h)),  # va
+            pl.BlockSpec((k_len, rank_k, block_h), lambda h, _: (0, 0, 0)),  # va
             pl.BlockSpec((k_len, rank_k, dim_v), lambda *_: (0, 0, 0)),  # vb
             (
                 pl.BlockSpec((block_q,), lambda _, lq: (lq,))  # q_segment_ids
@@ -536,8 +543,8 @@ def _fwd(
             ),
         ],
         out_specs=[
-            pl.BlockSpec((block_q, block_h, dim_v), lambda h, lq: (lq, h, 0)),  # out
-            pl.BlockSpec((block_q, block_h), lambda h, lq: (lq, h)),  # lse
+            pl.BlockSpec((block_q, num_heads, dim_v), lambda h, lq: (lq, 0, 0)),  # out
+            pl.BlockSpec((block_q, num_heads), lambda h, lq: (lq, 0)),  # lse
         ],
         out_shape=[
             jax.ShapeDtypeStruct(shape=(q_len, num_heads, dim_v), dtype=q.dtype),  # out
